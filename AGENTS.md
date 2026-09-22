@@ -64,3 +64,17 @@ The version is duplicated in `pyproject.toml` and `laya/__init__.py` (`__version
 - `research/` contains benchmark harnesses and result JSONs, and nothing in it is imported by `laya`. Edit `research/scripts/build_benchmark_nb.py`, not the generated `.ipynb`.
 - The numbers in `README.md` and `BENCHMARKS.md` are measured results. Don't change them without re-running the benchmarks. Jev figures are third-party published numbers and were never measured here.
 - `setuptools` is pinned to `packages = ["laya"]` because the root-level `assets/`, `research/`, and `notebooks/` directories break auto-discovery.
+
+## Plans
+
+`plans/` holds design plans for features that haven't been built yet. There is one numbered directory per initiative, `plans/<n>-<topic>/`. When you pick up work on an initiative, read its plan first. If the implementation diverges from the plan, update the plan.
+
+- **`plans/1-ModernVBERT/vision-stream.md`: vision stream (status: planned, not implemented; branch `sb/vision`).** The plan adds images as an input to laya through a fourth checkpoint, `laya-vision`. That checkpoint uses ModernVBERT (Ettin-150M + SigLIP2, `ModernVBertModel`, transformers ≥ 5.3) as the encoder, with laya's `DecisionModel` head on top. Its key decisions are:
+  - the image block goes *after* the options in the state segment, so markers and the `head_max_len` budget are unchanged, and it is never truncated;
+  - image features are computed once per call and reused across the rows for each question;
+  - the API is `predict(..., images=[...])`, with `Router` sending image requests to `vision`;
+  - the new dependencies go in an optional `laya[vision]` extra;
+  - training ports the notebook's RLCD loop to `research/scripts/train_vision.py`, with text-only typed-decisions replay;
+  - validation uses a new `tests/test_vision.py` (a tiny from-config ModernVBERT) and `research/scripts/bench_vision.py` (compared against SigLIP2 zero-shot).
+
+  Flux VAE latents were considered and rejected. ModernVBERT is English-first, so multilingual image+text decisions are out of scope.
