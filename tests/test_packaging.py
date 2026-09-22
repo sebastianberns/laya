@@ -58,6 +58,17 @@ check_true(
     "ModernBERT support starts in transformers 4.48",
 )
 
+# laya-vision runs on ModernVBERT, which transformers only knows from 5.3. That floor lives in the
+# optional `vision` extra (the core floor stays put) and must agree with the runtime check.
+vision_extra = re.search(r"^vision\s*=\s*\[(.*?)\]", pyproject, re.S | re.M)
+check_true("pyproject/declares a vision extra", vision_extra is not None)
+vision_floor = re.search(r'"transformers>=([\d.]+)"', vision_extra.group(1)) if vision_extra else None
+sys.path.insert(0, ROOT)
+from laya.vision import MIN_TRANSFORMERS  # noqa: E402
+check("vision/extra floor matches laya.vision.MIN_TRANSFORMERS",
+      version_tuple(vision_floor.group(1))[:2] if vision_floor else None, MIN_TRANSFORMERS)
+check_true("vision/extra needs pillow", vision_extra is not None and '"pillow' in vision_extra.group(1))
+
 for field in ("python_requires", "install_requires", "classifiers"):
     check_true(
         "setup.py/does not duplicate %s" % field,

@@ -32,6 +32,13 @@ dependencies = [
     "numpy>=1.20.0",
 ]
 
+[project.optional-dependencies]
+# The laya-vision checkpoint runs on ModernVBERT, which transformers ships from 5.3.
+vision = [
+    "transformers>=5.3.0",
+    "pillow>=9",
+]
+
 [tool.setuptools]
 # assets/, research/ and notebooks/ sit in the root, so auto-discovery bails out.
 packages = ["laya"]

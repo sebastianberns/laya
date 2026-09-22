@@ -36,7 +36,8 @@ jobs:
           python -m pip install --upgrade pip
           # CPU-only torch keeps the job under a minute instead of pulling CUDA wheels
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .
+          # the vision extra (transformers>=5.3, pillow) so tests/test_vision.py runs rather than skips
+          pip install -e ".[vision]"
 
       - name: Import check
         run: python -c "import laya; print(laya.__version__); print(sorted(laya.__all__))"
@@ -49,6 +50,7 @@ jobs:
           python tests/test_shortlist.py
           python tests/test_decision_model.py
           python tests/test_packaging.py
+          python tests/test_vision.py
 
       - name: Email cleaning tests
         run: python tests/test_email.py

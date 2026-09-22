@@ -26,6 +26,11 @@ primary routing signal.
 `typed-decisions` is never selected automatically unless you opt in with
 `auto_task_detection=True` or pass `task="typed_decisions"`: it is fine-tuned on four specific
 synthetic workflows and should not be a silent default.
+
+A fourth checkpoint, `vision` (ModernVBERT: Ettin-150M + SigLIP2, 1024 tokens, English-first),
+reads images alongside the state. Any request that carries images goes to it, because no text
+checkpoint can see them. It needs `pip install "laya[vision]"`; until it is published on the
+Hub, point the router at a local one with `Router(models={"vision": "/path/to/laya-vision"})`.
 """
 import os
 import threading
@@ -39,13 +44,19 @@ DEFAULT_MODELS = {
     "english": (BUNDLE_REPO, None),
     "multilingual": (BUNDLE_REPO, "multilingual"),
     "typed-decisions": (BUNDLE_REPO, "typed-decisions"),
+    "vision": (BUNDLE_REPO, "vision"),
 }
+
+# The text checkpoints: what `preload()` builds by default. Vision needs the optional extra, so
+# it is only preloaded when named or when the caller configured it explicitly.
+TEXT_MODELS = ("english", "multilingual", "typed-decisions")
 
 # The same checkpoints also live in their own repos, for anyone who prefers them.
 STANDALONE_MODELS = {
     "english": "convaiinnovations/laya",
     "multilingual": "convaiinnovations/laya-multilingual",
     "typed-decisions": "convaiinnovations/laya-typed-decisions",
+    "vision": "convaiinnovations/laya-vision",
 }
 
 
@@ -62,12 +73,19 @@ def _split(spec):
         return repo, sub
     return spec, None
 
+def _count_images(images) -> int:
+    if images is None:
+        return 0
+    return len(images) if isinstance(images, (list, tuple)) else 1
+
+
 # Aliases people are likely to type.
 _ALIASES = {
     "en": "english", "laya": "english", "default": "english",
     "multi": "multilingual", "ml": "multilingual", "laya-multilingual": "multilingual",
     "typed": "typed-decisions", "typed_decisions": "typed-decisions",
     "laya-typed-decisions": "typed-decisions", "decisions": "typed-decisions",
+    "laya-vision": "vision", "image": "vision", "images": "vision",
 }
 
 # Question-id signatures of the four typed-decisions workflows, used only when
@@ -154,7 +172,9 @@ class Router:
         preload: bool = False,
     ):
         self.models = dict(STANDALONE_MODELS if standalone_repos else DEFAULT_MODELS)
+        self._configured = set()
         if models:
+            self._configured = {normalise_name(k) for k in models}
             self.models.update({normalise_name(k): v for k, v in models.items()})
         self.device = device
         self.token = token or os.environ.get("HF_TOKEN")
@@ -227,8 +247,13 @@ class Router:
         checkpoint resident, routing is effectively free -- which is what you want in a
         server or a demo. `max_loaded` is raised to fit whatever is preloaded, otherwise
         the LRU would immediately evict what this just built.
+
+        By default this builds the text checkpoints, plus `vision` only if it was configured
+        through `models=`; name it to preload it from the Hub.
         """
-        names = [normalise_name(n) for n in (names or list(self.models))]
+        if not names:
+            names = [n for n in self.models if n in TEXT_MODELS or n in self._configured]
+        names = [normalise_name(n) for n in names]
         with self._lock:
             self.max_loaded = max(self.max_loaded, len(names), len(self._agents))
             for n in names:
@@ -261,11 +286,13 @@ class Router:
         model: Optional[str] = None,
         task: Optional[str] = None,
         lang: Optional[str] = None,
+        images: Optional[Any] = None,
     ) -> RouteDecision:
         """Decide which checkpoint to use, without loading or running anything.
 
-        Precedence: explicit `model` > explicit `task` > detected workflow (opt-in) >
-        explicit `lang` > detected script/language > default.
+        Precedence: explicit `model` > explicit `task` > images present > detected workflow
+        (opt-in) > explicit `lang` > detected script/language > default. An explicit text
+        model with images is honoured here and rejected by the model itself at predict time.
         """
         if model is not None:
             key = normalise_name(model)
@@ -276,6 +303,11 @@ class Router:
             key = normalise_name("typed-decisions" if str(task).lower().replace("-", "_") == "typed_decisions" else task)
             return RouteDecision(model=key, repo=_repo_str(self.models[key]), reason="explicit task=%r" % task,
                                  detection=None, workflow=None)
+
+        n_images = _count_images(images)
+        if n_images:
+            return RouteDecision(model="vision", repo=_repo_str(self.models["vision"]),
+                                 reason="state includes %d image(s)" % n_images, detection=None, workflow=None)
 
         workflow = match_typed_decisions_workflow(questions or {})
         if workflow and self.auto_task_detection:
@@ -319,14 +351,18 @@ class Router:
         model: Optional[str] = None,
         task: Optional[str] = None,
         lang: Optional[str] = None,
+        images: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Route, then answer every question in one forward pass on the chosen checkpoint.
 
         The result is the usual `system_one` payload plus a `routing` key recording the decision.
+        `images` (PIL images, paths, or bytes) join the state and send the request to `vision`.
         """
-        decision = self.route(state, questions, model=model, task=task, lang=lang)
+        decision = self.route(state, questions, model=model, task=task, lang=lang, images=images)
         agent = self.load(decision["model"])
-        result = agent.system_one(state, questions)
+        # Text requests keep the two-argument call, so attached custom agents keep working.
+        kw = {"images": images} if _count_images(images) else {}
+        result = agent.system_one(state, questions, **kw)
         result["routing"] = dict(decision)
         return result
 

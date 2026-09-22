@@ -15,7 +15,7 @@ export USE_TF=0 USE_TORCH=1 TOKENIZERS_PARALLELISM=false
 ```
 
 ```bash
-pip install -e .                      # CI installs CPU torch first: pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[vision]"            # CI installs CPU torch first: pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 # Tests are plain scripts, not pytest. Each exits non-zero on failure. Run one at a time:
 python tests/test_router.py           # routing + language detection (pure, no weights)
@@ -25,6 +25,7 @@ python tests/test_shortlist.py
 python tests/test_decision_model.py   # tiny from-config BERT, offline
 python tests/test_packaging.py        # pyproject metadata vs. dependency floors
 python tests/test_email.py
+python tests/test_vision.py           # tiny from-config ModernVBERT, offline; needs .[vision], else it skips
 
 # Needs real checkpoints on disk (not run in CI). Default root is ~/laya_models/{laya,laya-multilingual,laya-typed-decisions}
 python tests/test_local_e2e.py [model_root]    # LAYA_DEVICE=cpu|cuda|mps
@@ -52,10 +53,17 @@ The version is duplicated in `pyproject.toml` and `laya/__init__.py` (`__version
 - `system_one` (aliased as `predict`) batches all questions into one forward pass, then applies a temperature per bucket. The lookup order is `temperature_by_options[temp_bucket(qtype, k)]`, falling back to `temperature[qtype]`. All temperatures pass through `clamp_temperature` first, because some shipped buckets are fitted to sharpen rather than soften. `noul` always renders as the two options `[false, true]`, and its answer is `p[true]`.
 - `common.py` also contains training-side helpers that are exported publicly: `proper_reward`, `td_lambda_targets`, `ece_score`.
 
+**Vision** (`laya/vision.py`, the `laya-vision` checkpoint; `pip install "laya[vision]"` = transformers>=5.3 + pillow):
+- The encoder is ModernVBERT (`ModernVBertModel`: Ettin-150M text + SigLIP2 + a pixel-shuffle connector). A checkpoint is a vision one when `rl_agent_config.json` has a `vision` block (`tiles_per_side`, default 1). It ships `processor/` in place of `tokenizer/`, and `self.tok` is `processor.tokenizer`. `_verify_compatibility` additionally requires `encoder.vision_model.*` / `encoder.connector.*`.
+- `load_processor` builds the `Idefics3Processor` from its parts with the **PIL** image processor, because `AutoProcessor` demands torchvision in recent transformers. Training and inference must use the same resize path.
+- `system_one(state, questions, images=[...])`: `image_block` preprocesses once into a placeholder block (`<fake_token_around_image><global-img><image>×64<fake_token_around_image>` per image, 67 tokens without splitting). `build_sequence(prefix_ids=...)` opens the state segment with that block, *after* every marker, so markers and the `head_max_len` budget are unchanged. The block is never truncated and raises if it doesn't fit. The vision tower runs once per call via `encoder.get_image_features` and its features are `repeat`ed per question row (ModernVBERT assigns feature blocks to `<image>` runs in row order). Image tokens are scrubbed from all text on a vision checkpoint (`reserved_tokens=IMAGE_TOKENS`). `images` on a text checkpoint raises `ValueError`.
+- ModernVBERT is English-first: don't claim multilingual image+text decisions.
+- Training / eval: `research/scripts/train_vision.py` (the notebook's RLCD loop, frozen SigLIP, optional head warm-start from multilingual), `bench_vision.py` → `research/results/vision_benchmark.json`, with the shared splits in `vision_data.py`.
+
 **Routing** (`laya/router.py` + `laya/lang.py`):
-- `Router.route()` is pure: no weights, no I/O. The precedence order is: explicit `model` > explicit `task` > typed-decisions workflow match (only with `auto_task_detection=True`, and only on an exact match of the question-id set) > explicit `lang` > script/language detection > `default`.
+- `Router.route()` is pure: no weights, no I/O. The precedence order is: explicit `model` > explicit `task` > images present (→ `vision`) > typed-decisions workflow match (only with `auto_task_detection=True`, and only on an exact match of the question-id set) > explicit `lang` > script/language detection > `default`.
 - `lang.analyse` is pure-Python script detection plus Latin-script stopword and diacritic heuristics. The rule is that a Latin-script text whose language can't be identified is **never** assumed to be English. The English checkpoint collapses off-English while staying confident, so the routing decision has to happen before the forward pass.
-- `Router.load` caches agents in an LRU (`max_loaded`, default 1) under an `RLock`. Inference is deliberately kept outside the lock. `DEFAULT_MODELS` points all three checkpoints at subfolders of the bundle repo `convaiinnovations/laya` (root = english, `multilingual/`, `typed-decisions/`). `standalone_repos=True` uses the per-model repos instead.
+- `Router.load` caches agents in an LRU (`max_loaded`, default 1) under an `RLock`. Inference is deliberately kept outside the lock. `DEFAULT_MODELS` points all four checkpoints at subfolders of the bundle repo `convaiinnovations/laya` (root = english, `multilingual/`, `typed-decisions/`, `vision/`). `standalone_repos=True` uses the per-model repos instead. `laya-vision` is not published yet, so use `Router(models={"vision": "/path"})`. `preload()` with no names builds only the text checkpoints, plus `vision` when it was passed in `models=`.
 
 **Other modules:** `shortlist.py` pre-ranks large `choice` label sets with a caller-supplied `embed_fn` (or `embed_fn_from_agent`, which mean-pools the loaded encoder) and then runs one `predict` on the top `k` labels. `presets.py` and `email.py` contain ready-made question schemas and email-cleaning helpers. Everything public is re-exported from `laya/__init__.py` and listed in `__all__`.
 
@@ -69,7 +77,7 @@ The version is duplicated in `pyproject.toml` and `laya/__init__.py` (`__version
 
 `plans/` holds design plans for features that haven't been built yet. There is one numbered directory per initiative, `plans/<n>-<topic>/`. When you pick up work on an initiative, read its plan first. If the implementation diverges from the plan, update the plan.
 
-- **`plans/1-ModernVBERT/vision-stream.md`: vision stream (status: planned, not implemented; branch `sb/vision`).** The plan adds images as an input to laya through a fourth checkpoint, `laya-vision`. That checkpoint uses ModernVBERT (Ettin-150M + SigLIP2, `ModernVBertModel`, transformers ≥ 5.3) as the encoder, with laya's `DecisionModel` head on top. Its key decisions are:
+- **`plans/1-ModernVBERT/vision-stream.md`: vision stream (status: inference, tests, training and benchmark code implemented; training run, benchmark numbers and Hub publish pending; branch `sb/vision`).** The plan adds images as an input to laya through a fourth checkpoint, `laya-vision`. That checkpoint uses ModernVBERT (Ettin-150M + SigLIP2, `ModernVBertModel`, transformers ≥ 5.3) as the encoder, with laya's `DecisionModel` head on top. Its key decisions are:
   - the image block goes *after* the options in the state segment, so markers and the `head_max_len` budget are unchanged, and it is never truncated;
   - image features are computed once per call and reused across the rows for each question;
   - the API is `predict(..., images=[...])`, with `Router` sending image requests to `vision`;

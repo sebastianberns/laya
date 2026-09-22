@@ -1,5 +1,7 @@
 # Laya vision stream on ModernVBERT
 
+**Status:** the inference path, offline tests, training script and benchmark script are implemented, and a CPU smoke run of training and the benchmark completes on real data. Still to do, and needing the user's go-ahead: the GPU training run, the benchmark numbers, and publishing the checkpoint. See *Implementation notes* at the end for where the code diverges from the design below.
+
 ## Context
 
 Laya answers typed questions (`choice` / `score` / `noul`) about a text or JSON state in one encoder forward pass. The goal is to let images join the state.
@@ -30,7 +32,7 @@ The deliverable is a new, fourth checkpoint, `laya-vision`: ModernVBERT as the e
 
 **Encode once, reuse per question.** Laya runs one sequence per question. Images are preprocessed once per `system_one` call, and the vision tower plus connector run once (via the model's image-feature method, passed as `image_hidden_states`). The features are then repeated across all question rows, so N questions don't cost N vision passes.
 
-**Token budget.** The checkpoint config sets `max_len: 1024`, `head_max_len: 256` (the same as multilingual/typed-decisions) and a `vision` block. The default processor setting disables image splitting (1 tile ≈ 64 image tokens plus wrapper tokens), with a configurable `max_image_tiles` for documents. That leaves about 700 tokens for the state text.
+**Token budget.** The checkpoint config sets `max_len: 1024`, `head_max_len: 256` (the same as multilingual/typed-decisions) and a `vision` block. The default processor setting disables image splitting (1 tile = 64 image tokens plus 3 wrapper tokens = 67), with a configurable `tiles_per_side` for documents (implemented under that name rather than `max_image_tiles`; see the notes). That leaves about 700 tokens for the state text.
 
 **Head initialisation.** The head is new, but its shapes match `laya-multilingual` (mmBERT-base, d=768). The training script can warm-start the `head.*`, `type_emb.*`, `scorer.*` and `act_head.*` weights from it (the flag `--init-head multilingual`) or initialise them randomly, and the benchmark compares the two.
 
@@ -123,3 +125,22 @@ Any shortfall is written up in `BENCHMARKS.md`'s honest-limits style rather than
 - [ModernVBERT paper](https://arxiv.org/pdf/2510.01149) · [illuin-tech/modernvbert](https://github.com/illuin-tech/modernvbert) · [HF model card](https://huggingface.co/ModernVBERT/modernvbert)
 - [transformers ModernVBert source](https://github.com/huggingface/transformers/blob/main/src/transformers/models/modernvbert/modeling_modernvbert.py) · [ModernBERT `inputs_embeds`](https://github.com/huggingface/transformers/blob/main/src/transformers/models/modernbert/modular_modernbert.py)
 - [SigLIP 2](https://huggingface.co/blog/siglip2)
+
+## Implementation notes (divergences from the design above)
+
+- **Processor built from parts, PIL backend.** In transformers 5.17, `AutoProcessor`/`AutoImageProcessor` raise without torchvision for this model. `laya.vision.load_processor` therefore builds `Idefics3Processor(Idefics3ImageProcessorPil, tokenizer, image_seq_len)` directly (on 5.3 the class is `Idefics3ImageProcessor`). This adds no torchvision dependency, and training and inference resize identically. `image_seq_len` comes from `encoder.image_seq_len`, so it always matches the connector.
+- **`tiles_per_side`, not `max_image_tiles`.** The Idefics3 processor splits by longest edge, so the natural knob is "tiles per side" (`size.longest_edge = 512 × n`, up to n×n tiles plus a global view). A cap on the total isn't expressible. It lives in the config's `vision` block.
+- **Image-token scrubbing.** `build_sequence` gained `reserved_tokens`. On a vision checkpoint every Idefics3 image special token is scrubbed from text, like `[MASK]`, so a literal `<image>` in a state can't pose as a placeholder and break the feature merge.
+- **Shared features.** `get_image_features(...).pooler_output` is `[tiles, 64, d]`, and `inputs_merger` consumes blocks in row order, so sharing one call's image features across all question rows is `feats.repeat(n_rows, 1, 1)`. Tested against per-row vision (max diff < 1e-5).
+- **Router.** The `images` check sits after `model`/`task` and before workflow detection (no text checkpoint can see images). Aliases are `laya-vision`, `image` and `images`. `preload()` with no names skips `vision` unless it was passed in `models=`, because the checkpoint isn't on the Hub yet.
+- **`build_model` confirmed.** `AutoModel.from_pretrained("ModernVBERT/modernvbert")` resolves to `ModernVBertModel` (the MLM-head keys are dropped as unexpected), and `from_config` does the same. Only the `hidden_size` lookup changed. Head warm-start from multilingual loads all 35 head tensors with no shape mismatch.
+- **Data sources, resolved.** They live in `research/scripts/vision_data.py`:
+  - CIFAR-100 `uoft-cs/cifar100`;
+  - ImageNet-100 `clane9/imagenet-100` (opt-in via `--tasks`);
+  - RVL-CDIP `chainyo/rvl-cdip` (parquet; splits train/val/test);
+  - VQAv2 `lmms-lab/VQAv2`. Only `validation` carries answers, so the yes/no items use a crc32(image_id) 80/10/10 split and no image crosses splits. The soft target is the fraction of annotators answering yes;
+  - KonIQ-10k from `chaofengc/IQA-PyTorch-Datasets` (a 6.3 GB tgz, extracted once) plus its metainfo CSV. The `score` target is the per-image vote distribution `c1..c5` rather than 5 MOS bins, on the official train/val/test split;
+  - Pets `timm/oxford-iiit-pet` (test only, 20 seed-fixed breeds);
+  - typed-decisions replay, with val carved as 10% of train by case id.
+- **Calibration split.** Temperatures are fitted on each task's `val` split (600 per task), never on test. `temperature_by_options` buckets need ≥ 30 items.
+- **Measured so far (random weights, CPU, not a result):** with the real ModernVBERT architecture, 1 image adds 67 tokens per row and about 170 ms of SigLIP on an M-series CPU, paid once per call no matter how many questions. Real latency numbers come from `bench_vision.py`.

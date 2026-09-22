@@ -2,7 +2,7 @@
 import json
 import os
 import warnings
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -63,6 +63,8 @@ def _verify_compatibility(model: torch.nn.Module, cfg: Dict, weights: Dict[str, 
 
     # 2. Check for required component prefixes
     required_prefixes = ("encoder.", "type_emb.", "scorer.", "act_head.")
+    if cfg.get("vision"):
+        required_prefixes += ("encoder.vision_model.", "encoder.connector.")
     for prefix in required_prefixes:
         if not any(k.startswith(prefix) for k in weights.keys()):
             raise ValueError(
@@ -131,7 +133,7 @@ class Agent:
             kw = {
                 "token": token or os.environ.get("HF_TOKEN"),
                 "allow_patterns": [prefix + name for name in (
-                    "rl_agent_config.json", "model.safetensors", "tokenizer/*", "encoder/*",
+                    "rl_agent_config.json", "model.safetensors", "tokenizer/*", "encoder/*", "processor/*",
                 )],
             }
             model_dir = snapshot_download(model_id_or_path, **kw)
@@ -181,11 +183,24 @@ class Agent:
             else:
                 self.device = torch.device("cpu")
 
-        tok_dir = os.path.join(model_dir, "tokenizer")
-        self.tok = AutoTokenizer.from_pretrained(tok_dir if os.path.exists(tok_dir) else self.cfg.get("encoder"))
-
         enc_dir = os.path.join(model_dir, "encoder")
-        self.model = build_model(self.cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None)
+        self.vision = self.cfg.get("vision") or None
+        if self.vision:
+            # The processor's tokenizer carries the image-block special tokens, so it is the
+            # tokenizer for every sequence this checkpoint sees, with or without images.
+            from .vision import load_processor
+
+            self.model = build_model(self.cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None)
+            proc_dir = os.path.join(model_dir, "processor")
+            self.processor = load_processor(
+                proc_dir if os.path.exists(proc_dir) else self.cfg["encoder"],
+                image_seq_len=self.model.encoder.image_seq_len, token=token or os.environ.get("HF_TOKEN"))
+            self.tok = self.processor.tokenizer
+        else:
+            self.processor = None
+            tok_dir = os.path.join(model_dir, "tokenizer")
+            self.tok = AutoTokenizer.from_pretrained(tok_dir if os.path.exists(tok_dir) else self.cfg.get("encoder"))
+            self.model = build_model(self.cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None)
 
         # Load weights and verify architectural compatibility
         weights = load_file(weights_path)
@@ -196,10 +211,11 @@ class Agent:
         # ModernBERT's reference_compile defaults to "auto" and will torch.compile the encoder.
         # That is a loss for the batch sizes Laya runs (a handful of questions per call) and can
         # hang on some platforms, so keep the eager path.
-        try:
-            self.model.encoder.config.reference_compile = False
-        except Exception:
-            pass
+        for ecfg in (self.model.encoder.config, getattr(self.model.encoder.config, "text_config", None)):
+            try:
+                ecfg.reference_compile = False
+            except Exception:
+                pass
 
         # Keep what the checkpoint shipped for inspection, but only ever apply clamped values:
         # some buckets are fitted to sharpen rather than soften (see clamp_temperature).
@@ -263,7 +279,12 @@ class Agent:
         return {"t": t, "ins": ins, "crit": crit}
 
     @torch.no_grad()
-    def system_one(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    def system_one(
+        self,
+        state: Union[str, dict, list],
+        questions: Dict[str, Dict[str, Any]],
+        images: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
         """Evaluate typed questions across state in a single, parallel forward pass.
 
         Args:
@@ -272,18 +293,38 @@ class Agent:
                 - choice: {"type": "choice", "instructions": "...", "criteria": {"optA": "...", ...}}
                 - score:  {"type": "score",  "instructions": "...", "criteria": ["lvl0", "lvl1", ...]}
                 - noul:   {"type": "noul",   "instructions": "..."}
+            images: Optional images that join the state (PIL images, paths, or bytes). Only a
+                vision checkpoint accepts them; they are encoded once and shared by every question.
 
         Returns:
             Dictionary with answers, probabilities, calibrated confidence, and token usage.
         """
+        if images is not None and not isinstance(images, (list, tuple)):
+            images = [images]
+        if images and not self.vision:
+            raise ValueError(
+                "this checkpoint is text-only and cannot read images; load a vision checkpoint "
+                "(laya-vision) or route with Router, which sends image requests there")
+
         ids = list(questions.keys())
         items = []
         max_len = self.cfg.get("max_len", 512)
         head_max_len = self.cfg.get("head_max_len", 192)
 
+        prefix_ids, pixel_values, pixel_mask = None, None, None
+        if images:
+            from .vision import image_block
+
+            prefix_ids, pixel_values, pixel_mask = image_block(
+                self.processor, images, tiles_per_side=int(self.vision.get("tiles_per_side", 1)))
+        reserved = None
+        if self.vision:
+            from .vision import IMAGE_TOKENS as reserved
+
         for qid in ids:
             q = self._to_internal(questions[qid])
-            seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len)
+            seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len,
+                                          prefix_ids=prefix_ids, reserved_tokens=reserved)
             if len(markers) != len(render_options(q)):
                 raise ValueError("question %r options exceed head_max_len=%d" % (qid, head_max_len))
             items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
@@ -291,28 +332,35 @@ class Agent:
         b = collate_items([items], self.tok.pad_token_id)
         use_amp = self.device.type == "cuda"
 
+        def run():
+            kw = {}
+            if pixel_values is not None:
+                # Vision tower + connector once for the call, then the same features for every
+                # question row: the encoder consumes feature blocks in row order.
+                feats = self.model.encoder.get_image_features(
+                    pixel_values=pixel_values.to(self.device),
+                    pixel_attention_mask=pixel_mask.to(self.device) if pixel_mask is not None else None,
+                ).pooler_output
+                kw["image_hidden_states"] = feats.repeat(len(items), 1, 1)
+            return self.model(
+                b["input_ids"].to(self.device),
+                b["attention_mask"].to(self.device),
+                b["marker_pos"].to(self.device),
+                b["marker_mask"].to(self.device),
+                b["qtype"].to(self.device),
+                **kw,
+            )
+
         try:
             with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=use_amp):
-                logits, act = self.model(
-                    b["input_ids"].to(self.device),
-                    b["attention_mask"].to(self.device),
-                    b["marker_pos"].to(self.device),
-                    b["marker_mask"].to(self.device),
-                    b["qtype"].to(self.device),
-                )
+                logits, act = run()
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if self.device.type != "cpu" and ("memory" in str(e).lower() or "cuda" in str(e).lower()):
                 print("Warning: GPU memory exceeded during inference. Falling back to CPU...")
                 self.device = torch.device("cpu")
                 self.dtype = torch.float32
                 self.model.to(self.device)
-                logits, act = self.model(
-                    b["input_ids"].to(self.device),
-                    b["attention_mask"].to(self.device),
-                    b["marker_pos"].to(self.device),
-                    b["marker_mask"].to(self.device),
-                    b["qtype"].to(self.device),
-                )
+                logits, act = run()
             else:
                 raise e
 

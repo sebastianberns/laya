@@ -54,18 +54,35 @@ def build_sequence(
     head_max_len: int = 192,
     option_order: Optional[List[int]] = None,
     truncate_left: bool = False,
+    prefix_ids: Optional[List[int]] = None,
+    reserved_tokens: Optional[List[str]] = None,
 ):
-    """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]."""
+    """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] prefix state [SEP].
+
+    `prefix_ids` (the image block on a vision checkpoint) opens the state segment, after every
+    marker, so markers and the head budget are the same as without it. It is never truncated:
+    if it does not fit, this raises rather than silently dropping part of an image.
+
+    `reserved_tokens` are scrubbed from all text like the mask token, so a literal "<image>" in
+    the state cannot pose as an image placeholder.
+    """
     mask_tok = tok.mask_token
+    scrub = [mask_tok] + list(reserved_tokens or [])
+
+    def clean(text: str) -> str:
+        for t in scrub:
+            text = text.replace(t, " ")
+        return text
+
     opts = render_options(q)
     order = option_order if option_order is not None else list(range(len(opts)))
-    ins = str(q["ins"]).replace(mask_tok, " ")
+    ins = clean(str(q["ins"]))
     head_ids = tok("%s question: %s" % (q["t"], ins), add_special_tokens=False)["input_ids"]
     opt_ids = []
     for i in order:
         opt_ids.append(
             [tok.mask_token_id]
-            + tok(" " + opts[i].replace(mask_tok, " "), add_special_tokens=False)["input_ids"][:48]
+            + tok(" " + clean(opts[i]), add_special_tokens=False)["input_ids"][:48]
         )
     opt_budget = head_max_len - sum(len(o) for o in opt_ids)
     if opt_budget < 16:
@@ -80,9 +97,14 @@ def build_sequence(
         ids.extend(o)
     ids.append(tok.sep_token_id)
     room = max(0, max_len - len(ids) - 1)
-    st = tok(serialize_state(state).replace(mask_tok, " "), add_special_tokens=False)["input_ids"]
-    st = st[-room:] if truncate_left else st[:room]
-    ids = ids + st + [tok.sep_token_id]
+    prefix_ids = list(prefix_ids or [])
+    if len(prefix_ids) > room:
+        raise ValueError("image block of %d tokens does not fit: max_len=%d leaves %d after the question"
+                         % (len(prefix_ids), max_len, room))
+    room -= len(prefix_ids)
+    st = tok(clean(serialize_state(state)), add_special_tokens=False)["input_ids"]
+    st = (st[-room:] if room else []) if truncate_left else st[:room]
+    ids = ids + prefix_ids + st + [tok.sep_token_id]
     return ids[:max_len], [m for m in markers if m < max_len]
 
 
@@ -92,7 +114,8 @@ class DecisionModel(nn.Module):
     def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1):
         super().__init__()
         self.encoder = encoder
-        d = encoder.config.hidden_size
+        # A vision-language encoder (ModernVBERT) keeps its width on the text sub-config.
+        d = (getattr(encoder.config, "text_config", None) or encoder.config).hidden_size
         nhead = max(1, d // 64)
         layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
         self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
@@ -102,8 +125,12 @@ class DecisionModel(nn.Module):
         self.register_buffer("temperature", torch.ones(3))
         self.head_checkpointing = False
 
-    def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False):
-        h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False,
+                **encoder_kwargs):
+        # encoder_kwargs carries image inputs (pixel_values / pixel_attention_mask / image_hidden_states)
+        # to a vision encoder; a text-only call passes none, so the encoder call is unchanged.
+        encoder_kwargs = {k: v for k, v in encoder_kwargs.items() if v is not None}
+        h = self.encoder(input_ids=input_ids, attention_mask=attention_mask, **encoder_kwargs).last_hidden_state
         if detach_encoder:
             h = h.detach()
         h = h + self.type_emb(qtype)[:, None, :]
