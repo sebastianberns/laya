@@ -28,6 +28,7 @@ import random
 import sys
 import time
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from safetensors.torch import load_file, save_file
@@ -35,7 +36,10 @@ from safetensors.torch import load_file, save_file
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from laya.common import QTYPES, build_model, build_sequence, collate_items, proper_reward, temp_bucket  # noqa: E402
+from laya.common import (  # noqa: E402
+    QTYPE_NAMES, QTYPES, build_model, build_sequence, clamp_temperature, collate_items, ece_score,
+    proper_reward, temp_bucket,
+)
 from laya.vision import IMAGE_TOKENS, image_block, load_processor  # noqa: E402
 from vision_data import VISION_TASKS, build  # noqa: E402
 
@@ -197,6 +201,39 @@ def forward(model, b, device):
                  if b.get("pixel_attention_mask") is not None else None)
 
 
+def _ece_at(sel, t):
+    """Val ECE if this group were served at temperature `t`."""
+    conf, correct = [], []
+    for z, target in sel:
+        z = np.asarray(z, dtype=np.float64) / t
+        p = np.exp(z - z.max())
+        p = p / p.sum()
+        conf.append(float(p.max()))
+        correct.append(float(np.argmax(p) == np.argmax(target)))
+    return ece_score(np.array(conf), np.array(correct))
+
+
+def _keep_temp(sel, fitted, label, log):
+    """Ship a fitted temperature only when it calibrates better than leaving it alone.
+
+    A bucket pools every task with the same (type, option count): laya-vision's `choice:11+`
+    holds CIFAR-100, RVL-CDIP and typed-decisions at once. One scalar cannot serve all three --
+    fitting to the pooled NLL flattened a task that was already well calibrated and tripled its
+    test ECE -- so a temperature that does not improve val ECE is refused.
+
+    The check runs on the *clamped* value, because that is what inference applies: laya confines
+    temperatures to [0.5, 5] at load, so judging an unclamped fit would score a setting that never
+    actually runs.
+    """
+    fitted = clamp_temperature(fitted)
+    base, tuned = _ece_at(sel, 1.0), _ece_at(sel, fitted)
+    if tuned <= base:
+        log("    %-12s T=%.3f  val ECE %.4f -> %.4f" % (label, fitted, base, tuned))
+        return round(fitted, 4)
+    log("    %-12s T=%.3f REFUSED (val ECE %.4f -> %.4f); shipping T=1" % (label, fitted, base, tuned))
+    return 1.0
+
+
 def calibrate(model, loader, device, amp, log):
     """Per-type and per-bucket temperatures on the held-out val split (never the test split)."""
     model.eval()
@@ -209,12 +246,17 @@ def calibrate(model, loader, device, amp, log):
             for r in range(z.size(0)):
                 k = int(b["marker_mask"][r].sum())
                 preds.append((int(b["qtype"][r]), z[r, :k].tolist(), b["target"][r, :k].tolist()))
-    temps = [fit_one_temp([(z, t) for q, z, t in preds if q == qt]) for qt in range(3)]
+    temps = []
+    for qt in range(3):
+        sel = [(z, t) for q, z, t in preds if q == qt]
+        temps.append(_keep_temp(sel, fit_one_temp(sel), QTYPE_NAMES[qt], log) if sel else 1.0)
     by_bucket = {}
     for key in sorted({temp_bucket(q, len(z)) for q, z, _ in preds}):
         sel = [(z, t) for q, z, t in preds if temp_bucket(q, len(z)) == key]
         if len(sel) >= 30:
-            by_bucket[key] = round(fit_one_temp(sel), 4)
+            kept = _keep_temp(sel, fit_one_temp(sel), key, log)
+            if kept != 1.0:
+                by_bucket[key] = kept
     log("fitted temperatures (choice, score, noul): %s | by bucket: %s" % ([round(t, 3) for t in temps], by_bucket))
     return [round(t, 4) for t in temps], by_bucket, len(preds)
 

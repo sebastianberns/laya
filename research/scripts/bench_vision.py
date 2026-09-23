@@ -31,7 +31,15 @@ from vision_data import VISION_TASKS, build  # noqa: E402
 
 # Published reference points (README / BENCHMARKS.md), not re-measured here.
 TYPED_PUBLISHED = {"laya-typed-decisions": 0.766, "base checkpoints": 0.36}
-TRAINED_TASKS = VISION_TASKS + ["imagenet100"]
+
+
+def trained_tasks(agent):
+    """What this checkpoint was actually trained on, from its own config.
+
+    A static list would mis-report: a checkpoint trained without `koniq` is zero-shot on it, and
+    scoring that as a trained task turns 'both are near chance' into a win.
+    """
+    return set((agent.cfg.get("vision") or {}).get("tasks") or [])
 
 
 def parse_args():
@@ -243,7 +251,10 @@ def main():
     for name, path in models.items():
         agents[name] = agent = Agent(path, device=a.device)
         report["device"] = str(agent.device)
+        trained = trained_tasks(agent)
+        report.setdefault("trained_tasks", {})[name] = sorted(trained)
         for t in tasks:
+            report["tasks"][t].setdefault("trained_by", {})[name] = t in trained
             t0 = time.time()
             m = eval_typed(agent, data[t]) if t == "typed" else eval_laya(agent, data[t])
             report["tasks"][t][name] = m
@@ -281,10 +292,20 @@ def criteria(report, names, tasks):
     out = {}
     for name in names:
         c = {}
-        trained = [t for t in tasks if t in TRAINED_TASKS and "siglip2_zero_shot" in report["tasks"][t]]
+        has_sig = [t for t in tasks if "siglip2_zero_shot" in report["tasks"][t]]
+        trained = [t for t in has_sig if report["tasks"][t].get("trained_by", {}).get(name)]
         c["beats_siglip2_on_trained_tasks"] = {
             t: report["tasks"][t][name]["accuracy"] > report["tasks"][t]["siglip2_zero_shot"]["accuracy"]
             for t in trained} or None
+        # the rest are zero-shot probes for this checkpoint: reported, never scored as trained
+        c["zero_shot_vs_siglip2"] = {
+            t: {"model": report["tasks"][t][name]["accuracy"],
+                "siglip2": report["tasks"][t]["siglip2_zero_shot"]["accuracy"]}
+            for t in has_sig if t not in trained} or None
+        # temperature fitting must not make calibration worse than leaving it alone
+        c["temperature_improves_ece"] = {
+            t: report["tasks"][t][name]["after_temp"]["ece"] <= report["tasks"][t][name]["before_temp"]["ece"]
+            for t in tasks if name in report["tasks"][t] and "before_temp" in report["tasks"][t][name]}
         c["ece_after_temp_le_0.1"] = {t: report["tasks"][t][name]["after_temp"]["ece"] <= 0.1
                                       for t in tasks if name in report["tasks"][t]}
         if "typed" in tasks:
