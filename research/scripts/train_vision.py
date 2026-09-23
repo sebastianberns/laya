@@ -266,6 +266,23 @@ def main():
             return 12
         return a.n_per_task if a.n_per_task is not None else DEFAULT_N.get(t)
 
+    val_n = (lambda t: 12) if a.smoke else (lambda t: VAL_N)
+    # Data first, before any weights are downloaded: --prepare-only is then a CPU-only job, and a
+    # data problem surfaces before a 1.8 GB download. Building a split streams images, so doing it
+    # on every rank duplicates the cost and saturates the CPU while the GPUs idle: rank 0 builds,
+    # the others wait, all load from the cache.
+    log("preparing data for %s (cache: %s)" % (tasks, a.data_cache))
+    if rank == 0:
+        build_cache(tasks, "train", n_for, a.seed, a.data_cache, log)
+        build_cache(tasks, "val", val_n, a.seed, a.data_cache, log)
+    if ddp:
+        dist.barrier()
+    if a.prepare_only:
+        log("data prepared; exiting (--prepare-only)")
+        if ddp:
+            dist.destroy_process_group()
+        return
+
     cfg = {
         "encoder": a.encoder, "head_layers": 2, "max_len": a.max_len, "head_max_len": a.head_max_len,
         "act_costs": {"escalate": 0.5}, "amp_dtype": "fp16", "model_name": "laya-vision",
@@ -288,20 +305,6 @@ def main():
     net = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True) \
         if ddp else model
 
-    val_n = (lambda t: 12) if a.smoke else (lambda t: VAL_N)
-    # Building a split streams and re-encodes images: doing it on every rank duplicates the whole
-    # cost and saturates the CPU while the GPUs idle. Rank 0 builds, the others wait, all load.
-    log("preparing data for %s (cache: %s)" % (tasks, a.data_cache))
-    if rank == 0:
-        build_cache(tasks, "train", n_for, a.seed, a.data_cache, log)
-        build_cache(tasks, "val", val_n, a.seed, a.data_cache, log)
-    if ddp:
-        dist.barrier()
-    if a.prepare_only:
-        log("data prepared; exiting (--prepare-only)")
-        if ddp:
-            dist.destroy_process_group()
-        return
     train_ex = load_examples(tasks, "train", n_for, a.seed, a.data_cache, log)
     val_ex = load_examples(tasks, "val", val_n, a.seed, a.data_cache, log)
     random.Random(a.seed).shuffle(train_ex)
