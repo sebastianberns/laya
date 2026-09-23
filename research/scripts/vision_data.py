@@ -41,9 +41,19 @@ def _bucket(key, n: int = 100) -> int:
 
 
 def _img_bytes(img) -> bytes:
-    """PIL image -> PNG/JPEG bytes (whatever keeps it compact)."""
-    if isinstance(img, dict) and img.get("bytes"):
-        return img["bytes"]
+    """The image's encoded bytes, re-encoding only when there is no other choice.
+
+    With `decode=False` (see `_load`) datasets hands back {"bytes", "path"} straight from the
+    parquet file, so building a split costs no decode and no re-encode -- it was the dominant
+    cost, and it is pure waste when the DataLoader decodes lazily during training anyway.
+    """
+    if isinstance(img, dict):
+        if img.get("bytes"):
+            return img["bytes"]
+        if img.get("path"):
+            with open(img["path"], "rb") as f:
+                return f.read()
+        raise ValueError("image dict has neither bytes nor path")
     buf = io.BytesIO()
     img = img.convert("RGB")
     img.save(buf, format="JPEG" if max(img.size) > 128 else "PNG", quality=92)
@@ -60,22 +70,43 @@ def _choice(names: List[str], gold: int, rng: random.Random, ins: str, max_optio
     return {"q": {"t": "choice", "ins": ins, "crit": crit}, "target": target}
 
 
-def _take(ds, n: Optional[int], keep=lambda row: True):
+def _take(ds, n: Optional[int], keep=lambda row: True, label=""):
     out = []
     for row in ds:
         if keep(row):
             out.append(row)
+            _tick(len(out), n, label)
             if n is not None and len(out) >= n:
                 break
     return out
 
 
-def _load(repo, split, config=None, streaming=True, seed=0, shuffle=True):
+def _tick(i, n, label):
+    """Progress while a split streams: without it a slow build is indistinguishable from a hang."""
+    if label and i and i % PROGRESS_EVERY == 0:
+        print("    %s: %d%s" % (label, i, "/%d" % n if n else ""), flush=True)
+
+
+# A large buffer means nothing is yielded until it fills, which for document scans is minutes of
+# downloading before the first example. Shuffling a stream is a nicety here: the builders sample
+# and shuffle their own output anyway.
+SHUFFLE_BUFFER = 1_000
+PROGRESS_EVERY = 1_000
+
+
+def _load(repo, split, config=None, streaming=True, seed=0, shuffle=True, image_column=None):
+    """Load a split. `image_column` is handed back undecoded, so no image is decoded at build time."""
+    from datasets import Image as DsImage
     from datasets import load_dataset
 
     ds = load_dataset(repo, config, split=split, streaming=streaming)
+    if image_column:
+        try:
+            ds = ds.cast_column(image_column, DsImage(decode=False))
+        except Exception:       # older datasets, or a column that is not an Image feature
+            pass
     if shuffle:
-        ds = ds.shuffle(seed=seed, buffer_size=5_000) if streaming else ds.shuffle(seed=seed)
+        ds = ds.shuffle(seed=seed, buffer_size=SHUFFLE_BUFFER) if streaming else ds.shuffle(seed=seed)
     return ds
 
 
@@ -86,7 +117,7 @@ CIFAR_INS = ["What is in this image?", "Which object or animal does the photo sh
 
 def build_cifar100(split: str, n: Optional[int], seed: int = 0) -> List[Dict]:
     src = "train" if split == "train" else "test"
-    ds = _load("uoft-cs/cifar100", src, seed=seed, streaming=False, shuffle=False)
+    ds = _load("uoft-cs/cifar100", src, seed=seed, streaming=False, shuffle=False, image_column="img")
     names = [s.replace("_", " ") for s in ds.features["fine_label"].names]
     idx = list(range(len(ds)))
     if split != "train":
@@ -104,7 +135,7 @@ def build_cifar100(split: str, n: Optional[int], seed: int = 0) -> List[Dict]:
 def build_imagenet100(split: str, n: Optional[int], seed: int = 0) -> List[Dict]:
     # val/test alternate over the unshuffled validation stream, so they never overlap
     src = "train" if split == "train" else "validation"
-    ds = _load("clane9/imagenet-100", src, seed=seed, shuffle=split == "train")
+    ds = _load("clane9/imagenet-100", src, seed=seed, shuffle=split == "train", image_column="image")
     names = [s.split(",")[0].strip() for s in ds.features["label"].names]
     rng = random.Random("imagenet100-%s-%d" % (split, seed))
     parity = {"val": 0, "test": 1}.get(split)
@@ -123,11 +154,11 @@ RVL_INS = ["What type of document is this?", "Classify the scanned document.", "
 
 
 def build_rvl_cdip(split: str, n: Optional[int], seed: int = 0) -> List[Dict]:
-    ds = _load("chainyo/rvl-cdip", split, seed=seed)       # its splits are train / val / test
+    ds = _load("chainyo/rvl-cdip", split, seed=seed, image_column="image")   # splits: train/val/test
     names = ds.features["label"].names
     rng = random.Random("rvl-%s-%d" % (split, seed))
     out = []
-    for row in _take(ds, n):
+    for row in _take(ds, n, label="rvl_cdip %s" % split):
         ex = _choice(names, row["label"], rng, rng.choice(RVL_INS))
         out.append(dict(ex, task="rvl_cdip", state=rng.choice(CONTEXTS), images=[_img_bytes(row["image"])]))
     return out
@@ -135,14 +166,14 @@ def build_rvl_cdip(split: str, n: Optional[int], seed: int = 0) -> List[Dict]:
 
 def build_vqav2_yesno(split: str, n: Optional[int], seed: int = 0) -> List[Dict]:
     lo, hi = {"train": (0, 80), "val": (80, 90), "test": (90, 100)}[split]
-    ds = _load("lmms-lab/VQAv2", "validation", seed=seed)
+    ds = _load("lmms-lab/VQAv2", "validation", seed=seed, image_column="image")
 
     def keep(r):
         return r["answer_type"] == "yes/no" and lo <= _bucket(r["image_id"]) < hi
 
     out = []
     rng = random.Random("vqa-%s-%d" % (split, seed))
-    for row in _take(ds, n, keep):
+    for row in _take(ds, n, keep, label="vqav2_yesno %s" % split):
         votes = [a["answer"].strip().lower() for a in row["answers"]]
         yes, no = votes.count("yes"), votes.count("no")
         if yes + no == 0:
@@ -236,12 +267,12 @@ def build_pets(split: str, n: Optional[int], seed: int = 0) -> List[Dict]:
     """Zero-shot probe: never trained on. 20 breeds fixed by seed, evaluated as a 20-way choice."""
     if split != "test":
         raise ValueError("pets is an evaluation-only probe")
-    ds = _load("timm/oxford-iiit-pet", "test", streaming=False, shuffle=False)
+    ds = _load("timm/oxford-iiit-pet", "test", streaming=False, shuffle=False, image_column="image")
     names = [s.replace("_", " ") for s in ds.features["label"].names]
     rng = random.Random("pets-%d" % seed)
     breeds = sorted(rng.sample(range(len(names)), MAX_OPTIONS))
     sub = [names[i] for i in breeds]
-    idx = [i for i, lab in enumerate(ds["label"]) if lab in breeds]
+    idx = [i for i, lab in enumerate(ds["label"]) if lab in breeds]     # label column only: no decode
     rng.shuffle(idx)
     out = []
     for i in idx[:n]:

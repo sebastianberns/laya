@@ -19,6 +19,7 @@ rl_agent_config.json (+ `vision` block, fitted temperatures), model.safetensors,
     python research/scripts/train_vision.py --out /tmp/lv --smoke --tasks cifar100,vqav2_yesno,typed
 """
 import argparse
+import datetime
 import functools
 import json
 import math
@@ -63,6 +64,10 @@ def parse_args():
     ap.add_argument("--head-max-len", type=int, default=256)
     ap.add_argument("--tiles-per-side", type=int, default=1)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--data-cache", default=os.path.join(os.path.expanduser("~"), ".cache", "laya_vision", "examples"),
+                    help="where built splits are cached; reused across runs")
+    ap.add_argument("--prepare-only", action="store_true",
+                    help="build and cache the data, then exit (run once before torchrun)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--smoke", action="store_true", help="tiny data, one epoch, a few steps; checks the pipeline")
     return ap.parse_args()
@@ -113,12 +118,34 @@ def collate(items, pad_id):
     return b
 
 
-def load_examples(tasks, split, n_for, seed, log):
-    out = []
+def cache_file(cache_dir, task, split, n, seed):
+    return os.path.join(cache_dir, "%s-%s-n%s-s%d.pt" % (task, split, n, seed))
+
+
+def build_cache(tasks, split, n_for, seed, cache_dir, log):
+    """Build any split not already cached. One process only -- see `main`."""
+    os.makedirs(cache_dir, exist_ok=True)
     for t in tasks:
+        path = cache_file(cache_dir, t, split, n_for(t), seed)
+        if os.path.exists(path):
+            log("  %-12s %-5s cached" % (t, split))
+            continue
         t0 = time.time()
         ex = build(t, split, n_for(t), seed)
+        tmp = path + ".tmp"                     # never leave a half-written cache behind
+        torch.save(ex, tmp)
+        os.replace(tmp, path)
         log("  %-12s %-5s %6d examples (%.0fs)" % (t, split, len(ex), time.time() - t0))
+
+
+def load_examples(tasks, split, n_for, seed, cache_dir, log):
+    out = []
+    for t in tasks:
+        path = cache_file(cache_dir, t, split, n_for(t), seed)
+        if not os.path.exists(path):            # single-process run, or a cache that was cleared
+            build_cache([t], split, n_for, seed, cache_dir, log)
+        ex = torch.load(path, weights_only=False)
+        log("  %-12s %-5s %6d examples" % (t, split, len(ex)))
         out.extend(ex)
     return out
 
@@ -212,10 +239,13 @@ def main():
         local = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local)
         device = torch.device("cuda", local)
+        # Rank 0 builds the data while the others wait at a barrier; the default 30-minute
+        # collective timeout would kill them mid-build on a slow streaming dataset.
+        kw = {"timeout": datetime.timedelta(hours=4)}
         try:
-            dist.init_process_group("nccl", device_id=device)
+            dist.init_process_group("nccl", device_id=device, **kw)
         except TypeError:           # older torch: no device_id, barrier() just warns
-            dist.init_process_group("nccl")
+            dist.init_process_group("nccl", **kw)
         rank, world = dist.get_rank(), dist.get_world_size()
     else:
         rank, world = 0, 1
@@ -258,9 +288,22 @@ def main():
     net = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True) \
         if ddp else model
 
-    log("loading data for %s" % tasks)
-    train_ex = load_examples(tasks, "train", n_for, a.seed, log)
-    val_ex = load_examples(tasks, "val", (lambda t: 12) if a.smoke else (lambda t: VAL_N), a.seed, log)
+    val_n = (lambda t: 12) if a.smoke else (lambda t: VAL_N)
+    # Building a split streams and re-encodes images: doing it on every rank duplicates the whole
+    # cost and saturates the CPU while the GPUs idle. Rank 0 builds, the others wait, all load.
+    log("preparing data for %s (cache: %s)" % (tasks, a.data_cache))
+    if rank == 0:
+        build_cache(tasks, "train", n_for, a.seed, a.data_cache, log)
+        build_cache(tasks, "val", val_n, a.seed, a.data_cache, log)
+    if ddp:
+        dist.barrier()
+    if a.prepare_only:
+        log("data prepared; exiting (--prepare-only)")
+        if ddp:
+            dist.destroy_process_group()
+        return
+    train_ex = load_examples(tasks, "train", n_for, a.seed, a.data_cache, log)
+    val_ex = load_examples(tasks, "val", val_n, a.seed, a.data_cache, log)
     random.Random(a.seed).shuffle(train_ex)
     # Every rank must run the same number of batches: an uneven shard leaves one rank waiting
     # for an all-reduce that never comes. Drop the remainder (at most world_size-1 items).
