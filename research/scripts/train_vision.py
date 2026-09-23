@@ -21,6 +21,7 @@ rl_agent_config.json (+ `vision` block, fitted temperatures), model.safetensors,
 import argparse
 import functools
 import json
+import math
 import os
 import random
 import sys
@@ -208,11 +209,14 @@ def main():
     a = parse_args()
     ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if ddp:
-        dist.init_process_group("nccl")
-        rank, world = dist.get_rank(), dist.get_world_size()
         local = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local)
         device = torch.device("cuda", local)
+        try:
+            dist.init_process_group("nccl", device_id=device)
+        except TypeError:           # older torch: no device_id, barrier() just warns
+            dist.init_process_group("nccl")
+        rank, world = dist.get_rank(), dist.get_world_size()
     else:
         rank, world = 0, 1
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -249,6 +253,8 @@ def main():
     except Exception as e:                       # not fatal: only costs memory
         log("gradient checkpointing unavailable: %s" % e)
     model.to(device).train()
+    # find_unused_parameters: a micro-batch of text-only replay rows never touches the connector,
+    # so its parameters get no gradient in that step. Without the flag DDP raises on such a batch.
     net = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True) \
         if ddp else model
 
@@ -256,7 +262,9 @@ def main():
     train_ex = load_examples(tasks, "train", n_for, a.seed, log)
     val_ex = load_examples(tasks, "val", (lambda t: 12) if a.smoke else (lambda t: VAL_N), a.seed, log)
     random.Random(a.seed).shuffle(train_ex)
-    mine = train_ex[rank::world]
+    # Every rank must run the same number of batches: an uneven shard leaves one rank waiting
+    # for an all-reduce that never comes. Drop the remainder (at most world_size-1 items).
+    mine = train_ex[rank::world][:len(train_ex) // world]
 
     pad = proc.tokenizer.pad_token_id
     loader_kw = {"collate_fn": functools.partial(collate, pad_id=pad), "num_workers": 0 if a.smoke else a.workers}
@@ -266,8 +274,8 @@ def main():
     head_params = [p for n, p in model.named_parameters() if not n.startswith("encoder.")]
     opt = torch.optim.AdamW([{"params": enc_params, "lr": a.lr_encoder}, {"params": head_params, "lr": a.lr_head}],
                             weight_decay=0.01)
-    steps_per_epoch = len(mine) // a.micro_batch
-    total_updates = max(1, (steps_per_epoch // a.grad_accum) * epochs)
+    batches_per_epoch = math.ceil(len(mine) / a.micro_batch)          # DataLoader keeps the last short batch
+    total_updates = max(1, math.ceil(batches_per_epoch / a.grad_accum) * epochs)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_updates, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     GROUP_SIZE, SIGMA_START, SIGMA_END = 4, 0.4, 0.1
