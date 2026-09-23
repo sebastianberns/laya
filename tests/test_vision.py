@@ -122,6 +122,15 @@ with tempfile.TemporaryDirectory() as d:
     check("block/path input", image_block(proc, [path])[0], prefix)
     check("block/bytes input", image_block(proc, [raw])[0], prefix)
 check("block/single image not in a list", image_block(proc, RED)[0], prefix)
+
+# The first resize must be capped at the tile size, not the processor's shipped `size` (2048 on the
+# real checkpoint): with splitting off the image is squashed to one tile anyway, so a large
+# intermediate is pure cost, and preprocessing dominates image latency.
+_saved = proc.image_processor.size
+proc.image_processor.size = {"longest_edge": 64 * TILE}
+check("block/ignores an oversized configured size", image_block(proc, [RED])[1].shape[-2:], (TILE, TILE))
+check("block/same tokens with an oversized configured size", image_block(proc, [RED])[0], prefix)
+proc.image_processor.size = _saved
 check_raises("block/unsupported type", lambda: image_block(proc, [42]), TypeError)
 
 

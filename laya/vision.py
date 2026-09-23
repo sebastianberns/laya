@@ -108,10 +108,13 @@ def image_block(processor, images: Sequence[Any], tiles_per_side: int = 1) -> Tu
     imgs = [to_pil(im) for im in _as_list(images)]
     if not imgs:
         raise ValueError("image_block needs at least one image")
-    kw = {"do_image_splitting": tiles_per_side > 1}
-    if tiles_per_side > 1:
-        tile = processor.image_processor.max_image_size["longest_edge"]
-        kw["size"] = {"longest_edge": tile * int(tiles_per_side)}
+    tile = processor.image_processor.max_image_size["longest_edge"]
+    # `size` caps the first resize. The shipped config sets it to 2048, but with splitting off the
+    # image is squashed to one `tile`-square anyway, so that intermediate is thrown away: resizing
+    # 800x600 -> 2048x1536 -> 512x512 costs ~5x what going straight to 512 does, and preprocessing
+    # dominates the image latency. With splitting on, the grid genuinely needs tile * n.
+    kw = {"do_image_splitting": tiles_per_side > 1,
+          "size": {"longest_edge": tile * max(1, int(tiles_per_side))}}
     out = processor(text=[processor.image_token * len(imgs)], images=[imgs],
                     add_special_tokens=False, return_tensors="pt", **kw)
     tok = processor.tokenizer
