@@ -50,8 +50,12 @@ def parse_args():
 
 
 # --------------------------------------------------------------------------- metrics
-def metrics(rows, qtype):
-    """rows: dicts with p (after temps), p_raw (T=1) and target. Accuracy is against argmax(target)."""
+def metrics(rows):
+    """rows: dicts with p (after temps), p_raw (T=1), target and qtype. Accuracy is vs argmax(target).
+
+    A task can mix question types (typed-decisions does), and Brier over 2 options is not
+    comparable with Brier over 20, so a mixed task also reports each type separately.
+    """
     if not rows:
         return {}
     gold = np.array([int(np.argmax(r["target"])) for r in rows])
@@ -65,15 +69,31 @@ def metrics(rows, qtype):
         out[name] = {"accuracy": round(float(correct.mean()), 4), "brier": round(brier, 4),
                      "ece": round(ece_score(conf, correct), 4)}
     out["accuracy"] = out["after_temp"]["accuracy"]
-    if qtype == "score":
-        exp_p = [float((np.arange(len(r["p"])) * np.asarray(r["p"])).sum()) for r in rows]
-        exp_t = [float((np.arange(len(r["target"])) * np.asarray(r["target"])).sum()) for r in rows]
+    score_rows = [r for r in rows if r["qtype"] == "score"]
+    if score_rows:
+        exp_p = [float((np.arange(len(r["p"])) * np.asarray(r["p"])).sum()) for r in score_rows]
+        exp_t = [float((np.arange(len(r["target"])) * np.asarray(r["target"])).sum()) for r in score_rows]
         out["mae"] = round(float(np.mean(np.abs(np.array(exp_p) - np.array(exp_t)))), 4)
+    types = sorted({r["qtype"] for r in rows})
+    out["types"] = types
+    if len(types) > 1:
+        out["by_type"] = {t: metrics([r for r in rows if r["qtype"] == t]) for t in types}
     return out
 
 
-def trivial_baselines(examples, train_majority=None):
-    """Majority class (most common gold index in the split) and uniform random, analytically."""
+def trivial_baselines(examples):
+    """Majority class (most common gold label in the split) and uniform random, analytically.
+
+    Reported per question type as well when the task mixes them.
+    """
+    types = sorted({e["q"]["t"] for e in examples})
+    if len(types) > 1:
+        out = {t: trivial_baselines([e for e in examples if e["q"]["t"] == t]) for t in types}
+        gold_all = [int(np.argmax(e["target"])) for e in examples]
+        ks_all = [len(e["target"]) for e in examples]
+        out["overall"] = {"random": {"accuracy": round(float(np.mean([1.0 / k for k in ks_all])), 4)},
+                          "n": len(gold_all)}
+        return out
     gold = [int(np.argmax(e["target"])) for e in examples]
     ks = [len(e["target"]) for e in examples]
     # choice options are shuffled per item, so "majority" means the majority *label name*
@@ -120,8 +140,8 @@ def eval_laya(agent, examples):
         z = laya_logits(agent, ex)
         qt, k = QTYPES[ex["q"]["t"]], len(z)
         t = agent.temperature_by_options.get(temp_bucket(qt, k), agent.temperature[qt])
-        rows.append({"p_raw": softmax(z), "p": softmax(z / t), "target": ex["target"]})
-    return metrics(rows, examples[0]["q"]["t"])
+        rows.append({"p_raw": softmax(z), "p": softmax(z / t), "target": ex["target"], "qtype": ex["q"]["t"]})
+    return metrics(rows)
 
 
 def eval_typed(agent, examples):
@@ -170,8 +190,8 @@ def eval_siglip(sig, examples):
     rows = []
     for ex in examples:
         p = sig.probs(ex["images"][0], siglip_prompts(ex))
-        rows.append({"p_raw": p, "p": p, "target": ex["target"]})
-    m = metrics(rows, examples[0]["q"]["t"])
+        rows.append({"p_raw": p, "p": p, "target": ex["target"], "qtype": ex["q"]["t"]})
+    m = metrics(rows)
     m.pop("before_temp", None)
     return m
 
@@ -215,7 +235,9 @@ def main():
         print("%-12s %5d test examples (%.0fs)" % (t, len(data[t]), time.time() - t0), flush=True)
 
     for t in tasks:
-        report["tasks"][t] = {"type": data[t][0]["q"]["t"], "baselines": trivial_baselines(data[t])}
+        types = sorted({e["q"]["t"] for e in data[t]})
+        report["tasks"][t] = {"type": types[0] if len(types) == 1 else "mixed: " + "+".join(types),
+                              "baselines": trivial_baselines(data[t])}
 
     agents = {}
     for name, path in models.items():
@@ -266,8 +288,15 @@ def criteria(report, names, tasks):
         c["ece_after_temp_le_0.1"] = {t: report["tasks"][t][name]["after_temp"]["ece"] <= 0.1
                                       for t in tasks if name in report["tasks"][t]}
         if "typed" in tasks:
-            c["typed_ge_majority"] = (report["tasks"]["typed"][name]["accuracy"]
-                                      >= report["tasks"]["typed"]["baselines"]["majority"]["accuracy"])
+            base = report["tasks"]["typed"]["baselines"]
+            # mixed tasks nest baselines per type; compare per type, else against the one majority
+            if "majority" in base:
+                c["typed_ge_majority"] = (report["tasks"]["typed"][name]["accuracy"]
+                                          >= base["majority"]["accuracy"])
+            else:
+                by_type = report["tasks"]["typed"][name].get("by_type", {})
+                c["typed_ge_majority"] = {qt: by_type[qt]["accuracy"] >= base[qt]["majority"]["accuracy"]
+                                          for qt in by_type if qt in base}
         lat = report["latency"].get(name, {}).get("1q", {})
         if "baseline_text_ms" in lat:
             c["latency_1_image_lt_2x_text_baseline"] = lat["vision_1_image_ms"] < 2 * lat["baseline_text_ms"]
