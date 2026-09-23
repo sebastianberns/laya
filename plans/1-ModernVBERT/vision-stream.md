@@ -115,6 +115,33 @@ The deliverable is a new, fourth checkpoint, `laya-vision`: ModernVBERT as the e
 
 Any shortfall is written up in `BENCHMARKS.md`'s honest-limits style rather than tuned away.
 
+## First trained run — measured (2026-09-23)
+
+Kaggle 2xT4, tasks `cifar100,rvl_cdip,vqav2_yesno,typed` (no `koniq`, so KonIQ and Pets are both zero-shot probes), 3 epochs, effective batch 64, 500 test examples per task. Warm-start and random init trained with identical hyper-parameters.
+
+| task | random init | warm (multilingual) | SigLIP2 zero-shot | majority | blind (no image) |
+|---|---|---|---|---|---|
+| CIFAR-100 (trained) | 0.768 | 0.742 | **0.870** | 0.022 | 0.060 |
+| RVL-CDIP (trained) | 0.342 | 0.336 | **0.422** | 0.128 | 0.000 |
+| VQAv2 yes/no (trained) | **0.670** | 0.510 | 0.524 | 0.522 | 0.560 |
+| typed-decisions (text replay) | 0.582 | 0.516 | — | — | 0.580 |
+| KonIQ (zero-shot) | 0.206 | 0.158 | 0.102 | 0.544 | — |
+| Pets (zero-shot) | 0.128 | 0.080 | **0.956** | 0.064 | — |
+
+**What held.** The image path works: CIFAR is 0.768 against a 0.060 blind score, and RVL-CDIP 0.342 against 0.000 blind, so both are reading the image rather than exploiting label priors. Text did not collapse — typed-decisions 0.582 sits between the base checkpoints' 0.36 and the fine-tuned 0.766, and clears majority on all three question types.
+
+**What did not.**
+- Below SigLIP2 zero-shot on both recognition tasks, which was the headline criterion. Contrastive pretraining wins at what it was built for.
+- No zero-shot transfer: Pets 0.128 against SigLIP2's 0.956, near the 0.05 chance line. This checkpoint answers the categories it was trained on.
+- The VQAv2 win is smaller than it looks: blind (question text, no image) already scores 0.560, so the image is worth +0.100, not the +0.146 the SigLIP2 comparison suggests. Answer priors do the rest. State it that way.
+- KonIQ accuracy is far below its 0.544 majority (the MOS distribution is peaked), though MAE 0.396 beats SigLIP2's 0.605.
+
+**Warm-start is refuted.** Random init wins on all six tasks under identical hyper-parameters — clearest on VQAv2 (0.670 vs 0.510) and typed (0.582 vs 0.516). A head trained on mmBERT's representation space is a worse starting point than noise on Ettin's. `--init-head random` should be the default.
+
+**Temperature fitting hurt.** CIFAR-100 test ECE went 0.063 -> 0.285 because a bucket pools every task sharing a (type, option count): `choice:11+` holds CIFAR, RVL-CDIP and typed at once, and one scalar cannot serve all three. Training now ships a temperature only when it improves val ECE over T=1, judged at the clamped value inference applies. A multi-task checkpoint may simply not be calibratable by one temperature per bucket; per-task temperatures are not expressible at inference, which only sees type and option count.
+
+**Read of the cause.** The image is being used everywhere, so the limit is representation quality, not plumbing: with SigLIP frozen, only the connector and a 150M text encoder adapt, on 24k images over 3 epochs. Unfreezing the tower at a low LR is the untried lever, and would diverge from the design above.
+
 ## Out of scope / notes
 
 - The Flux VAE path is dropped, per the user.

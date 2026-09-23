@@ -50,6 +50,8 @@ def parse_args():
     ap.add_argument("--device", default=None)
     ap.add_argument("--siglip", default="google/siglip2-base-patch16-512")
     ap.add_argument("--no-siglip", action="store_true")
+    ap.add_argument("--no-blind", action="store_true",
+                    help="skip the images-removed control (it doubles evaluation time)")
     ap.add_argument("--latency-baseline", default="convaiinnovations/laya:multilingual",
                     help="text checkpoint (repo[:subfolder]) timed on the same state; '' to skip")
     ap.add_argument("--out", default=os.path.join(ROOT, "research", "results", "vision_benchmark.json"))
@@ -150,6 +152,16 @@ def eval_laya(agent, examples):
         t = agent.temperature_by_options.get(temp_bucket(qt, k), agent.temperature[qt])
         rows.append({"p_raw": softmax(z), "p": softmax(z / t), "target": ex["target"], "qtype": ex["q"]["t"]})
     return metrics(rows)
+
+
+def eval_blind(agent, examples):
+    """The same examples with the images removed: what the question text alone already gives.
+
+    The tightest baseline for a vision checkpoint. Majority and random say what a guesser scores;
+    blind says how much of the score needs no image at all -- on VQAv2 yes/no, answer priors alone
+    reach 0.56, so only the margin above that is the image being read.
+    """
+    return eval_laya(agent, [dict(e, images=[]) for e in examples])
 
 
 def eval_typed(agent, examples):
@@ -257,9 +269,15 @@ def main():
             report["tasks"][t].setdefault("trained_by", {})[name] = t in trained
             t0 = time.time()
             m = eval_typed(agent, data[t]) if t == "typed" else eval_laya(agent, data[t])
+            blind = ""
+            if not a.no_blind and any(e["images"] for e in data[t]):
+                b = eval_blind(agent, data[t])
+                m["blind"] = {"accuracy": b["accuracy"], "delta": round(m["accuracy"] - b["accuracy"], 4)}
+                blind = "  blind %.3f (%+.3f)" % (b["accuracy"], m["blind"]["delta"])
             report["tasks"][t][name] = m
-            print("%-8s %-12s acc %.3f  ece %.3f -> %.3f  (%.0fs)" % (
-                name, t, m["accuracy"], m["before_temp"]["ece"], m["after_temp"]["ece"], time.time() - t0), flush=True)
+            print("%-8s %-12s acc %.3f  ece %.3f -> %.3f%s  (%.0fs)" % (
+                name, t, m["accuracy"], m["before_temp"]["ece"], m["after_temp"]["ece"], blind,
+                time.time() - t0), flush=True)
 
     if not a.no_siglip:
         sig = SigLIP(a.siglip, next(iter(agents.values())).device)
@@ -302,6 +320,10 @@ def criteria(report, names, tasks):
             t: {"model": report["tasks"][t][name]["accuracy"],
                 "siglip2": report["tasks"][t]["siglip2_zero_shot"]["accuracy"]}
             for t in has_sig if t not in trained} or None
+        # what the image is worth: accuracy above the same questions asked without it
+        c["image_beats_blind"] = {
+            t: report["tasks"][t][name]["blind"]["delta"] > 0
+            for t in tasks if "blind" in report["tasks"][t].get(name, {})} or None
         # temperature fitting must not make calibration worse than leaving it alone
         c["temperature_improves_ece"] = {
             t: report["tasks"][t][name]["after_temp"]["ece"] <= report["tasks"][t][name]["before_temp"]["ece"]
