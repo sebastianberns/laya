@@ -79,8 +79,15 @@ def _as_list(images) -> List[Any]:
     return [images]
 
 
-def to_pil(image):
-    """A PIL RGB image from a PIL image, a file path, raw bytes, or a binary file object."""
+def to_pil(image, max_side: Optional[int] = None):
+    """A PIL RGB image from a PIL image, a file path, raw bytes, or a binary file object.
+
+    `max_side` shrinks anything larger so its longest edge is at most that, and never enlarges.
+    The processor resizes to the same geometry anyway, but capping here is what actually saves the
+    work, and it does not depend on the processor honouring a per-call `size`. (PIL's `draft`
+    reduced-scale JPEG decode was measured and left out: no gain below ~2048px, ~20% above it, and
+    no training source here is that large.)
+    """
     from PIL import Image
 
     if isinstance(image, Image.Image):
@@ -93,6 +100,9 @@ def to_pil(image):
         img = Image.open(image)
     else:
         raise TypeError("unsupported image of type %s; pass a PIL image, a path, or bytes" % type(image).__name__)
+    if max_side and max(img.size) > max_side:
+        img = img.copy() if img is image else img       # thumbnail is in-place: never touch the caller's image
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
     img.load()
     return img.convert("RGB")
 
@@ -105,14 +115,15 @@ def image_block(processor, images: Sequence[Any], tiles_per_side: int = 1) -> Tu
     `tiles_per_side=1` sends each image as one 512px tile (~67 tokens); a larger value splits
     images into up to n x n tiles plus a global view, for documents where detail matters.
     """
-    imgs = [to_pil(im) for im in _as_list(images)]
+    tile = processor.image_processor.max_image_size["longest_edge"]
+    imgs = [to_pil(im, max_side=tile * max(1, int(tiles_per_side))) for im in _as_list(images)]
     if not imgs:
         raise ValueError("image_block needs at least one image")
-    tile = processor.image_processor.max_image_size["longest_edge"]
-    # `size` caps the first resize. The shipped config sets it to 2048, but with splitting off the
-    # image is squashed to one `tile`-square anyway, so that intermediate is thrown away: resizing
-    # 800x600 -> 2048x1536 -> 512x512 costs ~5x what going straight to 512 does, and preprocessing
-    # dominates the image latency. With splitting on, the grid genuinely needs tile * n.
+    # `size` caps the processor's first resize. The shipped config sets it to 2048, but with
+    # splitting off the image is squashed to one `tile`-square anyway, so that intermediate is
+    # discarded work -- and preprocessing dominates image latency. The images are already capped
+    # above, which is what guarantees the saving; this kwarg only stops the processor from
+    # scaling them back up. With splitting on, the grid genuinely needs tile * n.
     kw = {"do_image_splitting": tiles_per_side > 1,
           "size": {"longest_edge": tile * max(1, int(tiles_per_side))}}
     out = processor(text=[processor.image_token * len(imgs)], images=[imgs],
