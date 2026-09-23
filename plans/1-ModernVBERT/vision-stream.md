@@ -143,4 +143,15 @@ Any shortfall is written up in `BENCHMARKS.md`'s honest-limits style rather than
   - Pets `timm/oxford-iiit-pet` (test only, 20 seed-fixed breeds);
   - typed-decisions replay, with val carved as 10% of train by case id.
 - **Calibration split.** Temperatures are fitted on each task's `val` split (600 per task), never on test. `temperature_by_options` buckets need ≥ 30 items.
-- **Measured so far (random weights, CPU, not a result):** with the real ModernVBERT architecture, 1 image adds 67 tokens per row and about 170 ms of SigLIP on an M-series CPU, paid once per call no matter how many questions. Real latency numbers come from `bench_vision.py`.
+- **Latency, measured on a Kaggle T4** (random/near-random weights, so timing only). 1 image adds 67 tokens per row, and the vision tower runs once per call: 197/195/198 ms for 1/5/10 questions before the preprocessing fix, i.e. flat, which is what the encode-once design is for.
+
+  The first smoke run showed preprocessing, not the tower, dominating: 119 ms of 166 ms. The cause was the Idefics3 processor resizing to `size.longest_edge` (2048 in the ModernVBERT config) before squashing to one 512 tile. Capping the size in `to_pil` (a per-call `size` kwarg alone proved unreliable) gives, on the same T4:
+
+  | | before | after |
+  |---|---|---|
+  | preprocess (CPU) | 125 ms | 24.7 ms |
+  | vision tower + connector (GPU) | 64.7 ms | 62.5 ms |
+  | `predict`, 1 image, 1 question | 188 ms | 74.7 ms |
+  | `predict`, text only | 27 ms | 26.8 ms |
+
+  **The "< 2× text-only" success criterion is therefore not going to be met for 1 image**: 74.7 ms against a 53.6 ms bar, with ~62 ms of it the irreducible SigLIP forward pass at 512px. Per question it looks much better, since the tower cost is amortised. Report it in `BENCHMARKS.md`'s honest-limits style, and/or restate the criterion per question; do not tune it away.
