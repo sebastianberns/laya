@@ -1,6 +1,8 @@
 # Laya vision stream on ModernVBERT
 
-**Status:** the inference path, offline tests, training script and benchmark script are implemented, and a CPU smoke run of training and the benchmark completes on real data. Still to do, and needing the user's go-ahead: the GPU training run, the benchmark numbers, and publishing the checkpoint. See *Implementation notes* at the end for where the code diverges from the design below.
+**Status:** implemented and trained once, not published. This file is the design; what was actually measured lives in [`report.md`](report.md) (summary, findings, conclusions) and [`experiments.md`](experiments.md) (run-by-run detail). *Implementation notes* at the end record where the code diverges from the design below.
+
+The headline result: the image path works and text did not collapse, but the checkpoint loses to SigLIP2 zero-shot on CIFAR-100 and RVL-CDIP, shows no zero-shot transfer, and the head warm-start below is refuted — random init wins on every task. The untried lever is the frozen SigLIP tower.
 
 ## Context
 
@@ -34,7 +36,7 @@ The deliverable is a new, fourth checkpoint, `laya-vision`: ModernVBERT as the e
 
 **Token budget.** The checkpoint config sets `max_len: 1024`, `head_max_len: 256` (the same as multilingual/typed-decisions) and a `vision` block. The default processor setting disables image splitting (1 tile = 64 image tokens plus 3 wrapper tokens = 67), with a configurable `tiles_per_side` for documents (implemented under that name rather than `max_image_tiles`; see the notes). That leaves about 700 tokens for the state text.
 
-**Head initialisation.** The head is new, but its shapes match `laya-multilingual` (mmBERT-base, d=768). The training script can warm-start the `head.*`, `type_emb.*`, `scorer.*` and `act_head.*` weights from it (the flag `--init-head multilingual`) or initialise them randomly, and the benchmark compares the two.
+**Head initialisation.** The head is new, but its shapes match `laya-multilingual` (mmBERT-base, d=768). The training script can warm-start the `head.*`, `type_emb.*`, `scorer.*` and `act_head.*` weights from it (the flag `--init-head multilingual`) or initialise them randomly, and the benchmark compares the two. **Measured: warm-starting loses on every task** (E3), so `random` should be the default; a head trained on mmBERT's space is a worse prior than noise on Ettin's. `laya` and `laya-typed-decisions` were never eligible — both are 1024-wide against ModernVBERT's 768.
 
 ## Code changes
 
@@ -73,7 +75,7 @@ The deliverable is a new, fourth checkpoint, `laya-vision`: ModernVBERT as the e
 - Port the RLCD loop from the notebook cell `train_ddp.py` (`notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb`) unchanged: the GRPO-style noisy logits, `proper_reward(w_sph=0.75, w_rps=1.0)`, the soft-CE guidance, and the two-LR AdamW.
 - Differences from the notebook:
   - the encoder is `ModernVBERT/modernvbert`;
-  - the SigLIP tower is frozen;
+  - the SigLIP tower is frozen (**the main open question after the first run**: only the connector and the 150M text encoder adapt, and unfreezing at a low LR is the untried lever — see `report.md`);
   - the LR for the connector and text encoder is 2.5e-5 and the head's is 1e-4;
   - items carry pixel tensors;
   - collation extends `collate_items` with stacked `pixel_values`.
@@ -115,33 +117,6 @@ The deliverable is a new, fourth checkpoint, `laya-vision`: ModernVBERT as the e
 
 Any shortfall is written up in `BENCHMARKS.md`'s honest-limits style rather than tuned away.
 
-## First trained run — measured (2026-09-23)
-
-Kaggle 2xT4, tasks `cifar100,rvl_cdip,vqav2_yesno,typed` (no `koniq`, so KonIQ and Pets are both zero-shot probes), 3 epochs, effective batch 64, 500 test examples per task. Warm-start and random init trained with identical hyper-parameters.
-
-| task | random init | warm (multilingual) | SigLIP2 zero-shot | majority | blind (no image) |
-|---|---|---|---|---|---|
-| CIFAR-100 (trained) | 0.768 | 0.742 | **0.870** | 0.022 | 0.060 |
-| RVL-CDIP (trained) | 0.342 | 0.336 | **0.422** | 0.128 | 0.000 |
-| VQAv2 yes/no (trained) | **0.670** | 0.510 | 0.524 | 0.522 | 0.560 |
-| typed-decisions (text replay) | 0.582 | 0.516 | — | — | 0.580 |
-| KonIQ (zero-shot) | 0.206 | 0.158 | 0.102 | 0.544 | — |
-| Pets (zero-shot) | 0.128 | 0.080 | **0.956** | 0.064 | — |
-
-**What held.** The image path works: CIFAR is 0.768 against a 0.060 blind score, and RVL-CDIP 0.342 against 0.000 blind, so both are reading the image rather than exploiting label priors. Text did not collapse — typed-decisions 0.582 sits between the base checkpoints' 0.36 and the fine-tuned 0.766, and clears majority on all three question types.
-
-**What did not.**
-- Below SigLIP2 zero-shot on both recognition tasks, which was the headline criterion. Contrastive pretraining wins at what it was built for.
-- No zero-shot transfer: Pets 0.128 against SigLIP2's 0.956, near the 0.05 chance line. This checkpoint answers the categories it was trained on.
-- The VQAv2 win is smaller than it looks: blind (question text, no image) already scores 0.560, so the image is worth +0.100, not the +0.146 the SigLIP2 comparison suggests. Answer priors do the rest. State it that way.
-- KonIQ accuracy is far below its 0.544 majority (the MOS distribution is peaked), though MAE 0.396 beats SigLIP2's 0.605.
-
-**Warm-start is refuted.** Random init wins on all six tasks under identical hyper-parameters — clearest on VQAv2 (0.670 vs 0.510) and typed (0.582 vs 0.516). A head trained on mmBERT's representation space is a worse starting point than noise on Ettin's. `--init-head random` should be the default.
-
-**Temperature fitting hurt.** CIFAR-100 test ECE went 0.063 -> 0.285 because a bucket pools every task sharing a (type, option count): `choice:11+` holds CIFAR, RVL-CDIP and typed at once, and one scalar cannot serve all three. Training now ships a temperature only when it improves val ECE over T=1, judged at the clamped value inference applies. A multi-task checkpoint may simply not be calibratable by one temperature per bucket; per-task temperatures are not expressible at inference, which only sees type and option count.
-
-**Read of the cause.** The image is being used everywhere, so the limit is representation quality, not plumbing: with SigLIP frozen, only the connector and a 150M text encoder adapt, on 24k images over 3 epochs. Unfreezing the tower at a low LR is the untried lever, and would diverge from the design above.
-
 ## Out of scope / notes
 
 - The Flux VAE path is dropped, per the user.
@@ -170,15 +145,4 @@ Kaggle 2xT4, tasks `cifar100,rvl_cdip,vqav2_yesno,typed` (no `koniq`, so KonIQ a
   - Pets `timm/oxford-iiit-pet` (test only, 20 seed-fixed breeds);
   - typed-decisions replay, with val carved as 10% of train by case id.
 - **Calibration split.** Temperatures are fitted on each task's `val` split (600 per task), never on test. `temperature_by_options` buckets need ≥ 30 items.
-- **Latency, measured on a Kaggle T4** (random/near-random weights, so timing only). 1 image adds 67 tokens per row, and the vision tower runs once per call: 197/195/198 ms for 1/5/10 questions before the preprocessing fix, i.e. flat, which is what the encode-once design is for.
-
-  The first smoke run showed preprocessing, not the tower, dominating: 119 ms of 166 ms. The cause was the Idefics3 processor resizing to `size.longest_edge` (2048 in the ModernVBERT config) before squashing to one 512 tile. Capping the size in `to_pil` (a per-call `size` kwarg alone proved unreliable) gives, on the same T4:
-
-  | | before | after |
-  |---|---|---|
-  | preprocess (CPU) | 125 ms | 24.7 ms |
-  | vision tower + connector (GPU) | 64.7 ms | 62.5 ms |
-  | `predict`, 1 image, 1 question | 188 ms | 74.7 ms |
-  | `predict`, text only | 27 ms | 26.8 ms |
-
-  **The "< 2× text-only" success criterion is therefore not going to be met for 1 image**: 74.7 ms against a 53.6 ms bar, with ~62 ms of it the irreducible SigLIP forward pass at 512px. Per question it looks much better, since the tower cost is amortised. Report it in `BENCHMARKS.md`'s honest-limits style, and/or restate the criterion per question; do not tune it away.
+- **Preprocessing, not the vision tower, dominated image latency** until it was fixed: the Idefics3 processor resizes to `size.longest_edge` (2048 in the ModernVBERT config) before squashing the image to one 512px tile, so images were enlarged only to be discarded. `to_pil` now caps the size before the processor sees it (a per-call `size` kwarg alone proved unreliable). Measurements in [`experiments.md`](experiments.md) (E2); the **"< 2× text-only" criterion is not met** — 2.3×, with the remainder mostly the SigLIP2 forward pass — and is reported as a limit in `BENCHMARKS.md` rather than tuned away.
