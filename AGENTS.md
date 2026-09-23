@@ -75,14 +75,16 @@ The version is duplicated in `pyproject.toml` and `laya/__init__.py` (`__version
 
 ## Plans
 
-`plans/` holds design plans for features that haven't been built yet. There is one numbered directory per initiative, `plans/<n>-<topic>/`. When you pick up work on an initiative, read its plan first. If the implementation diverges from the plan, update the plan.
+**[`plans/README.md`](plans/README.md) is the entry point**: the index of initiatives, the folder
+layout, and what belongs in a design, a report and an experiment log. One numbered directory per
+initiative, `plans/<n>-<topic>/`.
 
-- **`plans/1-ModernVBERT/`: vision stream (status: implemented and trained once, not published; branch `sb/vision`).** Three documents: `vision-stream.md` is the design, `report.md` summarises what was measured and what to do next, `experiments.md` is the run-by-run log. Read `report.md` first — it records that the checkpoint loses to SigLIP2 zero-shot on CIFAR-100 and RVL-CDIP, shows no zero-shot transfer, that the head warm-start is refuted (random init wins everywhere), and that unfreezing the frozen SigLIP tower is the untried lever. The plan adds images as an input to laya through a fourth checkpoint, `laya-vision`. That checkpoint uses ModernVBERT (Ettin-150M + SigLIP2, `ModernVBertModel`, transformers ≥ 5.3) as the encoder, with laya's `DecisionModel` head on top. Its key decisions are:
-  - the image block goes *after* the options in the state segment, so markers and the `head_max_len` budget are unchanged, and it is never truncated;
-  - image features are computed once per call and reused across the rows for each question;
-  - the API is `predict(..., images=[...])`, with `Router` sending image requests to `vision`;
-  - the new dependencies go in an optional `laya[vision]` extra;
-  - training ports the notebook's RLCD loop to `research/scripts/train_vision.py`, with text-only typed-decisions replay;
-  - validation uses a new `tests/test_vision.py` (a tiny from-config ModernVBERT) and `research/scripts/bench_vision.py` (compared against SigLIP2 zero-shot).
+When you pick up work on an initiative, read its `report.md` first if it has one — it says what is
+true now — then the design. If the implementation diverges from the design, update the design.
 
-  Flux VAE latents were considered and rejected. ModernVBERT is English-first, so multilingual image+text decisions are out of scope.
+- **`plans/1-ModernVBERT/`: vision stream, `laya-vision` (implemented and trained once, not
+  published; branch `sb/vision`).** Architecture is under *Vision* above; measured outcomes are in
+  [`report.md`](plans/1-ModernVBERT/report.md). In short: the image path works and text decisions did
+  not collapse, but the checkpoint loses to SigLIP2 zero-shot on CIFAR-100 and RVL-CDIP, shows no
+  zero-shot transfer, and the head warm-start is refuted (random init wins on every task). Unfreezing
+  the frozen SigLIP tower is the untried lever. Flux VAE latents were considered and rejected.
