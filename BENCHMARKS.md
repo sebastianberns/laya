@@ -169,6 +169,25 @@ banking77 is the one clear loss, and it is architectural: a choice question's op
 
 103–332 questions/sec batched. Jev independently measured at 236-276 ms p50, so Laya answers one question roughly **6–7× faster**.
 
+### Images — `laya-vision` (ModernVBERT), timings only
+
+**Not an accuracy result.** `laya-vision` is not trained or published yet; these are architecture timings, measured on a Tesla T4 with an untrained head, so they say what an image *costs*, not how well it is read.
+
+| p50, one `predict` call | ms |
+|---|---|
+| text only, 1 question | 26.8 |
+| **1 image**, 1 question | **74.7** |
+| `image_block` preprocessing alone (CPU) | 24.7 |
+| vision tower + connector alone (GPU) | 62.5 |
+
+The component rows are measured separately and overlap in a real call, so they do not sum to the end-to-end figure.
+
+An image costs roughly **2.8× a text-only call**, against the target of under 2×. About 62 ms of that is the SigLIP2 forward pass at 512px, which no amount of tuning on Laya's side removes — only a smaller vision tower would.
+
+**Batching is the mitigation**, and it works because the vision tower runs **once per call**, not once per question: its features are computed once and shared by every question in the same `predict`. Measured at 1 / 5 / 10 questions on one image: **197 / 195 / 198 ms** — flat (that run predates the preprocessing fix below, which lowers the whole curve; the flatness is the design and is unchanged). So the per-question cost of an image falls from ~75 ms at one question towards ~20 ms at ten. Ask every question you have about an image in a single call; do not loop one call per question.
+
+Preprocessing was the larger half of this until it was fixed: the Idefics3 processor resizes to `size.longest_edge` (2048 in the ModernVBERT config) before squashing the image to a single 512px tile, so images were being enlarged only to be discarded. Capping the size before the processor sees the image took CPU preprocessing from **125 ms to 24.7 ms** on the same T4.
+
 ### Calibration
 
 | | as shipped | temperature refit | 
@@ -200,3 +219,5 @@ At 20 options both are less order-stable than Jev — worth fixing with more agg
 - **Both checkpoints ship over-confident.** Fit temperatures on your own data.
 - **Ordinal `score` is the weakest primitive** (SST-5 0.372).
 - `laya` collapses outside English; `laya-multilingual` is weaker on English. Route.
+- **An image costs ~2.8× a text-only call** (74.7 ms vs 26.8 ms on a T4), most of it the SigLIP2 forward pass. It is charged **once per call, not per question**, so batch every question about an image into one `predict` — at ten questions the image costs ~20 ms each. `laya-vision` is not published yet, and has no accuracy numbers.
+- **`laya-vision` is English-first** (ModernVBERT's Ettin text encoder). It is not a multilingual image model.
