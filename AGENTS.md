@@ -88,3 +88,10 @@ true now — then the design. If the implementation diverges from the design, up
   not collapse, but the checkpoint loses to SigLIP2 zero-shot on CIFAR-100 and RVL-CDIP, shows no
   zero-shot transfer, and the head warm-start is refuted (random init wins on every task). Unfreezing
   the frozen SigLIP tower is the untried lever. Flux VAE latents were considered and rejected.
+- **`plans/2-SigLIP-tuning/`: unfreeze the SigLIP tower (planned, nothing run; branch `sb/vision`).**
+  Follows directly from initiative 1's open question — undertrained, or a structural limit of the
+  64-token connector? Adds `--vision-lr` to `research/scripts/train_vision.py` (default 0 = frozen,
+  today's behaviour), holds data/seed/epochs/batch fixed so any gain is attributable, and carries a
+  **pre-registered decision rule**: CIFAR-100 ≥ 0.80 and RVL-CDIP ≥ 0.40 means undertrained, neither
+  moving by ≥ +0.03 means structural and the line stops. It also owns the four pre-publication fixes
+  from initiative 1's report, starting with defaulting `--init-head` to `random`.

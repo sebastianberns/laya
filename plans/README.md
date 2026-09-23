@@ -9,6 +9,7 @@ to learn what is true now, rather than what was intended when the plan was writt
 | | initiative | status | start with |
 |---|---|---|---|
 | 1 | [ModernVBERT vision stream](1-ModernVBERT/) — images as an input to laya, via a fourth checkpoint `laya-vision` | implemented and trained once, **not published**; branch `sb/vision` | [`report.md`](1-ModernVBERT/report.md) |
+| 2 | [SigLIP tuning](2-SigLIP-tuning/) — unfreeze the vision tower, to decide whether `laya-vision` is undertrained or structurally limited | planned, nothing run; branch `sb/vision` | [`siglip-tuning.md`](2-SigLIP-tuning/siglip-tuning.md) |
 
 ## Layout
 
