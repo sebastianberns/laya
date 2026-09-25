@@ -4,8 +4,8 @@ The loop is the notebook's `train_ddp.py` (notebooks/laya_finetune_typed_decisio
 unchanged -- GRPO-style noisy logits, proper_reward(w_sph=0.75, w_rps=1.0), soft-CE guidance,
 two-LR AdamW, cosine schedule -- with these differences:
 
-  * encoder: ModernVBERT/modernvbert (Ettin-150M + SigLIP2-base-16-512); the SigLIP tower is frozen
-  * LRs: connector + text encoder 2.5e-5, head 1e-4
+  * encoder: ModernVBERT/modernvbert (Ettin-150M + SigLIP2-base-16-512)
+  * LRs: connector + text encoder 2.5e-5, head 1e-4; the SigLIP tower is frozen unless --vision-lr
   * items carry images; the collate stacks their pixel tiles in row order
   * data: vision tasks + text-only typed-decisions replay (see vision_data.py)
   * head: random init, or warm-started from laya-multilingual (--init-head multilingual; same d=768)
@@ -15,6 +15,8 @@ rl_agent_config.json (+ `vision` block, fitted temperatures), model.safetensors,
 
     # 2xT4 (Kaggle), as the notebook
     torchrun --standalone --nproc_per_node=2 research/scripts/train_vision.py --out /kaggle/working/laya-vision
+    # the same, with the SigLIP tower trainable (plans/2-SigLIP-tuning/)
+    torchrun --standalone --nproc_per_node=2 research/scripts/train_vision.py --out /out --vision-lr 5e-6
     # CPU smoke run: a few examples per task, one short epoch
     python research/scripts/train_vision.py --out /tmp/lv --smoke --tasks cifar100,vqav2_yesno,typed
 """
@@ -56,7 +58,10 @@ def parse_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
     ap.add_argument("--encoder", default="ModernVBERT/modernvbert")
-    ap.add_argument("--init-head", choices=["random", "multilingual"], default="multilingual")
+    ap.add_argument("--init-head", choices=["random", "multilingual"], default="random",
+                    help="random (default): measured to beat the multilingual warm-start on all six "
+                         "benchmark tasks at identical hyper-parameters -- a head trained on mmBERT's "
+                         "representation space is a worse prior than noise on Ettin's")
     ap.add_argument("--tasks", default=",".join(VISION_TASKS + ["typed"]))
     ap.add_argument("--n-per-task", type=int, default=None, help="cap examples per task (default: DEFAULT_N)")
     ap.add_argument("--epochs", type=int, default=3)
@@ -64,6 +69,15 @@ def parse_args():
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--lr-encoder", type=float, default=2.5e-5)
     ap.add_argument("--lr-head", type=float, default=1e-4)
+    ap.add_argument("--vision-lr", type=float, default=0.0,
+                    help="learning rate for the SigLIP tower; 0 (the default) keeps it frozen, as in the "
+                         "first trained checkpoint. Non-zero gives it its own optimiser group")
+    ap.add_argument("--vision-unfreeze-last", type=int, default=0,
+                    help="with --vision-lr, train only the last N of the tower's 12 layers (0 = all of it); "
+                         "a fallback for memory pressure or forgetting, not an experimental arm")
+    ap.add_argument("--no-val-epoch", action="store_true",
+                    help="skip the per-epoch validation pass (it is the only in-run signal of "
+                         "overfitting or forgetting, so skip it only to save time)")
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--head-max-len", type=int, default=256)
     ap.add_argument("--tiles-per-side", type=int, default=1)
@@ -169,6 +183,68 @@ def warm_start_head(model, log):
     left = [k for k in missing if k.startswith(HEAD_PREFIXES)]
     note = " (still random: %s)" % left if left else ""
     log("warm-started %d head tensors from %s/%s%s" % (len(head), repo, sub, note))
+
+
+def set_vision_trainable(model, vision_lr, unfreeze_last, log):
+    """Freeze the SigLIP tower, or open it (or its last N layers) at `vision_lr`.
+
+    Returns the tower parameters that are to be trained -- empty when it stays frozen. They are
+    handed back rather than found again later because the optimiser must give them their own
+    group: every one of them also matches `encoder.`, so leaving them in the encoder group would
+    optimise the tower twice, at two learning rates.
+    """
+    tower = model.encoder.vision_model
+    for p in tower.parameters():
+        p.requires_grad_(False)
+    if vision_lr <= 0:
+        return []
+    if unfreeze_last <= 0:
+        for p in tower.parameters():
+            p.requires_grad_(True)
+    else:
+        layers = tower.encoder.layers
+        n = min(unfreeze_last, len(layers))
+        # the final layernorm sits after the layers, so it belongs to the same block
+        parts = list(layers[len(layers) - n:]) + [getattr(tower, "post_layernorm", None)]
+        for m in parts:
+            if m is not None:
+                for p in m.parameters():
+                    p.requires_grad_(True)
+        log("unfroze the last %d of %d SigLIP layers (+ post_layernorm)" % (n, len(layers)))
+    return [p for p in tower.parameters() if p.requires_grad]
+
+
+@torch.no_grad()
+def val_accuracy(model, examples, proc, a, device, amp, loader_kw):
+    """Accuracy per task on the held-out val split, as argmax(logits) vs argmax(target).
+
+    Reported per task, never as a mean: the trade-off being watched is one task improving while
+    another forgets, and an average hides exactly that. Cheap enough to run every epoch (600 val
+    examples per task), which is the point -- end-of-run calibration is too late to see a 94M
+    parameter tower overfitting 24k images.
+    """
+    was_training = model.training
+    model.eval()
+    out = {}
+    for task in sorted({e["task"] for e in examples}):
+        rows = [e for e in examples if e["task"] == task]
+        loader = torch.utils.data.DataLoader(
+            Items(rows, proc, a.max_len, a.head_max_len, a.tiles_per_side), batch_size=16, **loader_kw)
+        right = seen = 0
+        for b in loader:
+            if b is None:
+                continue
+            with torch.autocast(device.type, dtype=torch.float16, enabled=amp):
+                logits, _ = forward(model, b, device)
+            mask = b["marker_mask"]
+            pred = logits.float().cpu().masked_fill(~mask, -1e4).argmax(-1)
+            gold = (b["target"] * mask).argmax(-1)
+            right += int((pred == gold).sum())
+            seen += int(pred.numel())
+        out[task] = {"accuracy": round(right / max(1, seen), 4), "n": seen}
+    if was_training:
+        model.train()
+    return out
 
 
 def fit_one_temp(sel):
@@ -328,15 +404,15 @@ def main():
     cfg = {
         "encoder": a.encoder, "head_layers": 2, "max_len": a.max_len, "head_max_len": a.head_max_len,
         "act_costs": {"escalate": 0.5}, "amp_dtype": "fp16", "model_name": "laya-vision",
-        "vision": {"tiles_per_side": a.tiles_per_side, "tasks": tasks},
+        "vision": {"tiles_per_side": a.tiles_per_side, "tasks": tasks, "vision_lr": a.vision_lr,
+                   "vision_unfreeze_last": a.vision_unfreeze_last},
     }
     model = build_model(cfg)                      # from_pretrained: ModernVBertModel
     proc = load_processor(a.encoder, image_seq_len=model.encoder.image_seq_len)
     cfg["vision"]["image_seq_len"] = model.encoder.image_seq_len
     if a.init_head == "multilingual":
         warm_start_head(model, log)
-    for p in model.encoder.vision_model.parameters():
-        p.requires_grad_(False)
+    vis_params = set_vision_trainable(model, a.vision_lr, a.vision_unfreeze_last, log)
     try:
         model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     except Exception as e:                       # not fatal: only costs memory
@@ -344,6 +420,8 @@ def main():
     model.to(device).train()
     # find_unused_parameters: a micro-batch of text-only replay rows never touches the connector,
     # so its parameters get no gradient in that step. Without the flag DDP raises on such a batch.
+    # With --vision-lr the same batch leaves the whole tower ungradiented, so the flag is
+    # load-bearing rather than merely prudent.
     net = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True) \
         if ddp else model
 
@@ -358,19 +436,36 @@ def main():
     loader_kw = {"collate_fn": functools.partial(collate, pad_id=pad), "num_workers": 0 if a.smoke else a.workers}
     train_ds = Items(mine, proc, a.max_len, a.head_max_len, a.tiles_per_side)
 
-    enc_params = [p for n, p in model.named_parameters() if n.startswith("encoder.") and p.requires_grad]
+    # The tower's parameters all match `encoder.`, so they are excluded here and added as their own
+    # group below; otherwise AdamW would hold them twice and step them at two learning rates.
+    vis_ids = {id(p) for p in vis_params}
+    enc_params = [p for n, p in model.named_parameters()
+                  if n.startswith("encoder.") and p.requires_grad and id(p) not in vis_ids]
     head_params = [p for n, p in model.named_parameters() if not n.startswith("encoder.")]
-    opt = torch.optim.AdamW([{"params": enc_params, "lr": a.lr_encoder}, {"params": head_params, "lr": a.lr_head}],
-                            weight_decay=0.01)
+    groups = [{"params": enc_params, "lr": a.lr_encoder}, {"params": head_params, "lr": a.lr_head}]
+    if vis_params:
+        groups.append({"params": vis_params, "lr": a.vision_lr})
+    opt = torch.optim.AdamW(groups, weight_decay=0.01)
     batches_per_epoch = math.ceil(len(mine) / a.micro_batch)          # DataLoader keeps the last short batch
     total_updates = max(1, math.ceil(batches_per_epoch / a.grad_accum) * epochs)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_updates, eta_min=1e-6)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     GROUP_SIZE, SIGMA_START, SIGMA_END = 4, 0.4, 0.1
 
-    log("training: %d items (%d per rank) | %d epochs | %d updates | init-head=%s | frozen SigLIP"
+    # State what is actually being trained, not what the flags implied: the whole point of this
+    # run is which parameters move, and a silent typo in a flag would otherwise pass for a result.
+    def millions(params):
+        return sum(p.numel() for p in params) / 1e6
+
+    tower_total = millions(model.encoder.vision_model.parameters())
+    log("training: %d items (%d per rank) | %d epochs | %d updates | init-head=%s"
         % (len(train_ex), len(mine), epochs, total_updates, a.init_head))
+    log("trainable: %d optimiser groups | encoder(text+connector) %.2fM @ %.1e | head %.2fM @ %.1e"
+        % (len(groups), millions(enc_params), a.lr_encoder, millions(head_params), a.lr_head))
+    log("           SigLIP tower %s (%.2fM of %.2fM trainable)"
+        % (("@ %.1e" % a.vision_lr) if vis_params else "frozen", millions(vis_params), tower_total))
     t0 = time.time()
+    val_history = []
     for epoch in range(epochs):
         g = torch.Generator().manual_seed(a.seed + epoch + rank)
         loader = torch.utils.data.DataLoader(train_ds, batch_size=a.micro_batch, shuffle=True, generator=g,
@@ -425,9 +520,18 @@ def main():
         if ddp:
             dist.barrier()
         if rank == 0:
+            if not a.no_val_epoch:
+                acc = val_accuracy(model, val_ex, proc, a, device, amp, loader_kw)
+                val_history.append(dict(epoch=epoch + 1, **{t: v["accuracy"] for t, v in acc.items()}))
+                log("    val: %s" % " | ".join("%s %.3f" % (t, v["accuracy"]) for t, v in acc.items()))
             # rolling checkpoint, so a Kaggle timeout does not lose finished epochs
             save_checkpoint(os.path.join(a.out, "checkpoint_latest"), model, proc,
-                            dict(cfg, checkpoint={"epoch": epoch + 1, "avg_loss": run_loss / max(1, n_b)}))
+                            dict(cfg, checkpoint={"epoch": epoch + 1, "avg_loss": run_loss / max(1, n_b),
+                                                  "val_accuracy": val_history}))
+        if ddp:
+            # rank 0 validates and saves while the others would otherwise start the next epoch and
+            # sit in an all-reduce; hold them here instead, so a stall is attributable.
+            dist.barrier()
 
     if rank == 0:
         val_ds = Items(val_ex, proc, a.max_len, a.head_max_len, a.tiles_per_side)
@@ -435,7 +539,11 @@ def main():
         temps, by_bucket, n_cal = calibrate(model, val_loader, device, amp, log)
         cfg.update(temperature=temps, temperature_by_options=by_bucket, fine_tuned=True, init_head=a.init_head,
                    training={"epochs": epochs, "items": len(train_ex), "calibration_items": n_cal,
-                             "world_size": world, "hours": round((time.time() - t0) / 3600, 3), "smoke": a.smoke})
+                             "world_size": world, "hours": round((time.time() - t0) / 3600, 3), "smoke": a.smoke,
+                             "lr_encoder": a.lr_encoder, "lr_head": a.lr_head, "vision_lr": a.vision_lr,
+                             "trainable_vision_params": sum(p.numel() for p in vis_params),
+                             "micro_batch": a.micro_batch, "grad_accum": a.grad_accum,
+                             "val_accuracy": val_history})
         save_checkpoint(a.out, model, proc, cfg)
         log("saved laya-vision checkpoint to %s" % a.out)
     if ddp:
