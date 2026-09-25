@@ -465,14 +465,14 @@ def main():
     log("           SigLIP tower %s (%.2fM of %.2fM trainable)"
         % (("@ %.1e" % a.vision_lr) if vis_params else "frozen", millions(vis_params), tower_total))
     t0 = time.time()
-    val_history = []
+    val_history, skips = [], []
     for epoch in range(epochs):
         g = torch.Generator().manual_seed(a.seed + epoch + rank)
         loader = torch.utils.data.DataLoader(train_ds, batch_size=a.micro_batch, shuffle=True, generator=g,
                                              **loader_kw)
         sigma = SIGMA_START + (SIGMA_END - SIGMA_START) * (epoch / max(1, epochs - 1))
         opt.zero_grad(set_to_none=True)
-        run_loss, n_b = 0.0, 0
+        run_loss, n_b, skipped = 0.0, 0, 0
         for step, b in enumerate(loader):
             if b is None:
                 continue
@@ -503,8 +503,15 @@ def main():
             if (step + 1) % a.grad_accum == 0 or step + 1 == len(loader):
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+                # A scale that drops means inf/nan gradients: AdamW skipped that update entirely.
+                # One or two at the start is GradScaler finding its scale; a stream of them is
+                # fp16 instability, which is a live risk once the tower trains and a T4 has no
+                # usable bf16. Count them -- torch only emits a scheduler warning, which is not
+                # a signal anybody reads. The schedule still steps, as in the frozen baseline.
+                before = scaler.get_scale()
                 scaler.step(opt)
                 scaler.update()
+                skipped += scaler.get_scale() < before
                 sched.step()
                 opt.zero_grad(set_to_none=True)
             run_loss += loss.item() * a.grad_accum
@@ -515,8 +522,9 @@ def main():
                        time.time() - t0))
             if a.smoke and n_b >= 3:
                 break
-        log("=== epoch %d/%d done | avg loss %.4f | %.0fs"
-            % (epoch + 1, epochs, run_loss / max(1, n_b), time.time() - t0))
+        skips.append(int(skipped))
+        log("=== epoch %d/%d done | avg loss %.4f | %d fp16-skipped updates | %.0fs"
+            % (epoch + 1, epochs, run_loss / max(1, n_b), skipped, time.time() - t0))
         if ddp:
             dist.barrier()
         if rank == 0:
@@ -542,6 +550,7 @@ def main():
                              "world_size": world, "hours": round((time.time() - t0) / 3600, 3), "smoke": a.smoke,
                              "lr_encoder": a.lr_encoder, "lr_head": a.lr_head, "vision_lr": a.vision_lr,
                              "trainable_vision_params": sum(p.numel() for p in vis_params),
+                             "fp16_skipped_updates": skips,
                              "micro_batch": a.micro_batch, "grad_accum": a.grad_accum,
                              "val_accuracy": val_history})
         save_checkpoint(a.out, model, proc, cfg)
