@@ -58,7 +58,7 @@ The version is duplicated in `pyproject.toml` and `laya/__init__.py` (`__version
 - `load_processor` builds the `Idefics3Processor` from its parts with the **PIL** image processor, because `AutoProcessor` demands torchvision in recent transformers. Training and inference must use the same resize path.
 - `system_one(state, questions, images=[...])`: `image_block` preprocesses once into a placeholder block (`<fake_token_around_image><global-img><image>×64<fake_token_around_image>` per image, 67 tokens without splitting). `build_sequence(prefix_ids=...)` opens the state segment with that block, *after* every marker, so markers and the `head_max_len` budget are unchanged. The block is never truncated and raises if it doesn't fit. The vision tower runs once per call via `encoder.get_image_features` and its features are `repeat`ed per question row (ModernVBERT assigns feature blocks to `<image>` runs in row order). Image tokens are scrubbed from all text on a vision checkpoint (`reserved_tokens=IMAGE_TOKENS`). `images` on a text checkpoint raises `ValueError`.
 - ModernVBERT is English-first: don't claim multilingual image+text decisions.
-- Training / eval: `research/scripts/train_vision.py` (the notebook's RLCD loop, frozen SigLIP, optional head warm-start from multilingual), `bench_vision.py` → `research/results/vision_benchmark.json`, with the shared splits in `vision_data.py`. `notebooks/laya_vision_train_2xT4_kaggle.ipynb` drives all of it on Kaggle (smoke test first, then the real run); it clones the branch because the vision code is not on PyPI.
+- Training / eval: `research/scripts/train_vision.py` (the notebook's RLCD loop; the SigLIP tower is frozen unless `--vision-lr`, head random-init by default or warm-started from multilingual), `bench_vision.py` → `research/results/vision_benchmark.json`, with the shared splits in `vision_data.py`. Two Kaggle notebooks drive it, both cloning the branch because the vision code is not on PyPI: `notebooks/laya_vision_train_2xT4_kaggle.ipynb` (initiative 1) and `notebooks/laya_vision_siglip_tuning_2xT4_kaggle.ipynb` (initiative 2). Smoke test first, then the real run.
 
 **Routing** (`laya/router.py` + `laya/lang.py`):
 - `Router.route()` is pure: no weights, no I/O. The precedence order is: explicit `model` > explicit `task` > images present (→ `vision`) > typed-decisions workflow match (only with `auto_task_detection=True`, and only on an exact match of the question-id set) > explicit `lang` > script/language detection > `default`.
@@ -88,10 +88,13 @@ true now — then the design. If the implementation diverges from the design, up
   not collapse, but the checkpoint loses to SigLIP2 zero-shot on CIFAR-100 and RVL-CDIP, shows no
   zero-shot transfer, and the head warm-start is refuted (random init wins on every task). Unfreezing
   the frozen SigLIP tower is the untried lever. Flux VAE latents were considered and rejected.
-- **`plans/2-SigLIP-tuning/`: unfreeze the SigLIP tower (planned, nothing run; branch `sb/vision`).**
-  Follows directly from initiative 1's open question — undertrained, or a structural limit of the
-  64-token connector? Adds `--vision-lr` to `research/scripts/train_vision.py` (default 0 = frozen,
-  today's behaviour), holds data/seed/epochs/batch fixed so any gain is attributable, and carries a
-  **pre-registered decision rule**: CIFAR-100 ≥ 0.80 and RVL-CDIP ≥ 0.40 means undertrained, neither
-  moving by ≥ +0.03 means structural and the line stops. It also owns the four pre-publication fixes
-  from initiative 1's report, starting with defaulting `--init-head` to `random`.
+- **`plans/2-SigLIP-tuning/`: unfreeze the SigLIP tower (code landed and smoke-tested, E5–E7 not run;
+  branch `sb/vision`).** Follows directly from initiative 1's open question — undertrained, or a
+  structural limit of the 64-token connector? `--vision-lr` (default 0 = frozen, today's behaviour)
+  gives the tower its own optimiser group, `--vision-unfreeze-last N` opens only its last N layers,
+  every run logs what it actually trains, and validation accuracy is reported per task per epoch.
+  Data/seed/epochs/batch are held fixed so any gain is attributable, and a **pre-registered decision
+  rule** decides the outcome: CIFAR-100 ≥ 0.80 and RVL-CDIP ≥ 0.40 means undertrained, neither moving
+  by ≥ +0.03 means structural and the line stops. `notebooks/laya_vision_siglip_tuning_2xT4_kaggle.ipynb`
+  runs the experiments and evaluates that rule in code. The four pre-publication fixes from
+  initiative 1's report have landed — `--init-head` now defaults to `random`.

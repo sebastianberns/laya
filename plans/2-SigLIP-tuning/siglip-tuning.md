@@ -1,6 +1,7 @@
 # Unfreezing the SigLIP tower in laya-vision
 
-**Status:** planned, nothing run. Branch: `sb/vision` (continues from initiative 1).
+**Status:** code landed, nothing run. `--vision-lr` and the per-epoch validation are implemented and
+smoke-tested on CPU; E5–E7 have not been run. Branch: `sb/vision` (continues from initiative 1).
 
 ## Context
 
@@ -37,15 +38,16 @@ Independent of the experiment, and carried from the report's pre-publication lis
 uses random init anyway, and the documentation claims should be corrected whether or not unfreezing
 works:
 
-1. **Default `--init-head` to `random`** in `research/scripts/train_vision.py`. Warm-starting from
+1. ✅ **Default `--init-head` to `random`** in `research/scripts/train_vision.py`. Warm-starting from
    `laya-multilingual` lost on all six tasks at identical hyper-parameters; a head trained on
    mmBERT's representation space is a worse prior than noise on Ettin's. Keep `multilingual` as an
    option, with the measured outcome in the flag's help text.
-2. **State VQAv2 as "0.560 blind → 0.660 with image"**, never as a margin over SigLIP2: answer priors
-   in the question text supply most of the score, and the image is worth +0.100.
-3. **Say plainly that there is no zero-shot transfer** (Pets 0.128 against SigLIP2's 0.956, chance
+2. ✅ **State VQAv2 as "0.560 blind → 0.660 with image"**, never as a margin over SigLIP2: answer
+   priors in the question text supply most of the score, and the image is worth +0.100.
+   (`BENCHMARKS.md` *Limits*.)
+3. ✅ **Say plainly that there is no zero-shot transfer** (Pets 0.128 against SigLIP2's 0.956, chance
    0.050) and that the model is English-first (ModernVBERT's Ettin text side).
-4. **Confirm** the latency limit and its batching mitigation are in `BENCHMARKS.md` — already
+4. ✅ **Confirm** the latency limit and its batching mitigation are in `BENCHMARKS.md` — already
    written, needs re-checking only if numbers change.
 
 ## Code changes
@@ -73,6 +75,30 @@ today's behaviour, so the frozen baseline remains comparable.
   report per task, since a mean across tasks would hide exactly the trade-off being watched.
 - **Record `vision_lr`** in the config's `vision` block, so a checkpoint states how it was trained.
 
+## Implementation notes
+
+What landed, and where it differs from the design above. All in `research/scripts/train_vision.py`.
+
+- **`--vision-lr` works as specified.** Verified on CPU with a `--smoke` run per arm: the default
+  reports `2 optimiser groups … SigLIP tower frozen (0.00M of 93.52M trainable)`, `--vision-lr 5e-6`
+  reports `3 optimiser groups … SigLIP tower @ 5.0e-06 (93.52M of 93.52M trainable)`, and the
+  encoder group is 158.48M in both — the tower moves into its own group rather than being added to
+  the encoder's. After one optimiser step, 160 of the tower's 208 tensors differ between the two
+  checkpoints, so the tower demonstrably trains; `laya.Agent` still loads the result and answers.
+- **Per-epoch validation is on by default**, with `--no-val-epoch` to skip it, rather than being
+  opt-in. It is the only in-run signal of forgetting, and a monitor nobody switches on is not a
+  monitor. It runs on rank 0 only (no collectives), followed by a barrier so the other ranks do not
+  start the next epoch and sit in an all-reduce while rank 0 validates and saves.
+- **`--vision-unfreeze-last N` also unfreezes the tower's `post_layernorm`**, which sits after the
+  layers and belongs to the same block. Measured: `--vision-unfreeze-last 6` trains 42.53M of the
+  tower's 93.52M, as the 43M estimate above predicted.
+- **The checkpoint records more than `vision_lr`.** The `vision` block carries `vision_lr` and
+  `vision_unfreeze_last`; `training` carries the learning rates, micro-batch, grad-accum,
+  `trainable_vision_params` and the per-epoch validation history. A checkpoint states how it was
+  trained, and the E5 comparison reads the checkpoints rather than the scrollback.
+- **Notebook:** [`notebooks/laya_vision_siglip_tuning_2xT4_kaggle.ipynb`](../../notebooks/laya_vision_siglip_tuning_2xT4_kaggle.ipynb)
+  drives E5–E7 on a Kaggle 2×T4, and evaluates the decision rule below in code.
+
 ## Experiments
 
 Data, seed, epochs and effective batch are fixed at initiative 1's values. The tower's learning rate
@@ -97,8 +123,12 @@ random-init arm; SigLIP2 references are 0.870 (CIFAR-100), 0.422 (RVL-CDIP), 0.9
 | outcome | rule | what follows |
 |---|---|---|
 | **Undertrained** | CIFAR-100 ≥ 0.80 **and** RVL-CDIP ≥ 0.40 | continue the line: scale data and epochs, revisit KonIQ |
-| **Partial** | exactly one improves by ≥ +0.03 | one follow-up run before deciding |
+| **Partial** | at least one improves by ≥ +0.03, thresholds not met | one follow-up run before deciding |
 | **Structural limit** | neither improves by ≥ +0.03 | stop; write up the narrower claim |
+
+The original wording of the middle row was "exactly one improves by ≥ +0.03". Both improving without
+either reaching its threshold is the same situation — real movement, not enough of it — so it scores
+`PARTIAL` as well. Fixed here and in the notebook before any number existed, not afterwards.
 
 **Guardrails**, reported whether or not they bind:
 
@@ -135,12 +165,12 @@ random-init arm; SigLIP2 references are 0.870 (CIFAR-100), 0.422 (RVL-CDIP), 0.9
 
 ## Validation
 
-- `--vision-lr 0` reproduces today's behaviour exactly: frozen tower, two param groups.
-- `tests/test_vision.py` and the other seven suites pass unchanged; `ruff` and `compileall` clean.
-- A CPU `--smoke` run with `--vision-lr 5e-6` reports three param groups and a non-zero trainable
+- ✅ `--vision-lr 0` reproduces today's behaviour exactly: frozen tower, two param groups.
+- ✅ `tests/test_vision.py` and the other seven suites pass unchanged; `ruff` and `compileall` clean.
+- ✅ A CPU `--smoke` run with `--vision-lr 5e-6` reports three param groups and a non-zero trainable
   tower count, and one with `--vision-lr 0` reports two.
-- A 2-GPU `--smoke` run before any real stage, as in initiative 1 — DDP is where the last two
-  training bugs appeared.
+- ⏳ A 2-GPU `--smoke` run before any real stage, as in initiative 1 — DDP is where the last two
+  training bugs appeared. It is section 4 of the notebook, and needs a GPU session.
 
 ## Deliverables
 

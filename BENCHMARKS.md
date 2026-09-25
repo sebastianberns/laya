@@ -171,7 +171,7 @@ banking77 is the one clear loss, and it is architectural: a choice question's op
 
 ### Images — `laya-vision` (ModernVBERT), timings only
 
-**Not an accuracy result.** `laya-vision` is not trained or published yet; these are architecture timings, measured on a Tesla T4 with an untrained head, so they say what an image *costs*, not how well it is read.
+**Not an accuracy result.** `laya-vision` is **not published**; these are architecture timings, measured on a Tesla T4, so they say what an image *costs*, not how well it is read. The checkpoint has since been trained once — those accuracies are in [`plans/1-ModernVBERT/report.md`](plans/1-ModernVBERT/report.md), not here, because nothing ships from them. In short, and stated the way the limits below are: it loses to SigLIP2 zero-shot at recognition (CIFAR-100 0.768 vs 0.870, RVL-CDIP 0.342 vs 0.422), it has **no zero-shot transfer** to categories it was not trained on (Pets 0.128 against SigLIP2's 0.956, chance 0.050), and on VQAv2 yes/no it goes from **0.560 blind to 0.670 with the image** — the question text alone supplies most of that score, so the image is worth about +0.10, not the margin over SigLIP2.
 
 | p50, one `predict` call | 1 question | 5 questions | 10 questions |
 |---|---|---|---|
@@ -220,3 +220,5 @@ At 20 options both are less order-stable than Jev — worth fixing with more agg
 - `laya` collapses outside English; `laya-multilingual` is weaker on English. Route.
 - **An image costs ~2.3× a text-only call** (59.5 ms vs 26.2 ms on a T4), most of it the SigLIP2 forward pass. It is charged **once per call, not per question**, so batch every question about an image into one `predict` — at ten questions the image costs ~7 ms each.
 - **`laya-vision` is English-first** (ModernVBERT's Ettin text encoder). It is not a multilingual image model.
+- **`laya-vision` answers only the categories it was trained on.** Zero-shot on an unseen label set it sits near chance (Pets 0.128, chance 0.050), where SigLIP2 zero-shot reaches 0.956. "Typed questions about any image" is not a supported claim.
+- **Some of a vision score needs no image.** On VQAv2 yes/no the same questions asked blind already reach 0.560 against 0.670 with the image, so read any image benchmark against its blind baseline, not against chance.
