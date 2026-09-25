@@ -1,7 +1,9 @@
 # Unfreezing the SigLIP tower in laya-vision
 
-**Status:** code landed, nothing run. `--vision-lr` and the per-epoch validation are implemented and
-smoke-tested on CPU; E5–E7 have not been run. Branch: `sb/vision` (continues from initiative 1).
+**Status:** run and measured; the decision rule returned **PARTIAL**. See
+[`report.md`](report.md) for the outcome and [`experiments.md`](experiments.md) for the runs. Branch:
+`sb/vision` (continues from initiative 1). This file stays the design; it is not updated with
+results.
 
 ## Context
 
@@ -25,7 +27,8 @@ billions of image–text pairs. The tower is 93.5M parameters in 12 layers.
 those two, and nothing else should change while it runs.
 
 **Hypothesis.** Letting the tower adapt at a low learning rate closes most of the gap to SigLIP2 on
-CIFAR-100 and RVL-CDIP.
+CIFAR-100 and RVL-CDIP. — *Outcome: half right. CIFAR-100 passed SigLIP2 (0.916 vs 0.870); RVL-CDIP
+moved +0.018 and still loses. See [`report.md`](report.md) findings 1 and 2.*
 
 **Falsifier, stated up front.** If the tower demonstrably trains (loss moves, trainable parameter
 count is non-zero, per-epoch validation shifts) and CIFAR-100 and RVL-CDIP still do not move, then
@@ -104,6 +107,8 @@ What landed, and where it differs from the design above. All in `research/script
 Data, seed, epochs and effective batch are fixed at initiative 1's values. The tower's learning rate
 is the only variable.
 
+*E5 chose 5e-6 and caught a 2e-5 collapse that would have faked a null result.*
+
 **E5 — learning-rate probe.** 1 epoch, `--n-per-task 3000`, at `2e-6`, `5e-6` and `2e-5` (the text
 side runs at 2.5e-5), plus a frozen control on the same subset. Decide on per-task validation
 accuracy. ~10–12 min each. This exists so a null result in E6 cannot be blamed on a guessed LR.
@@ -169,10 +174,10 @@ either reaching its threshold is the same situation — real movement, not enoug
 - ✅ `tests/test_vision.py` and the other seven suites pass unchanged; `ruff` and `compileall` clean.
 - ✅ A CPU `--smoke` run with `--vision-lr 5e-6` reports three param groups and a non-zero trainable
   tower count, and one with `--vision-lr 0` reports two.
-- ⏳ A 2-GPU `--smoke` run before any real stage, as in initiative 1 — DDP is where the last two
-  training bugs appeared. It is section 4 of the notebook, and needs a GPU session.
+- ✅ A 2-GPU `--smoke` run before any real stage, as in initiative 1 — DDP is where the last two
+  training bugs appeared. Ran clean on a Kaggle 2×T4 before E5.
 
 ## Deliverables
 
-`report.md` and `experiments.md` in this directory once E5–E7 have run, following the conventions in
-[`plans/README.md`](../README.md); `BENCHMARKS.md` only if published numbers change.
+✅ [`report.md`](report.md) and [`experiments.md`](experiments.md), written after E5–E7.
+`BENCHMARKS.md` is unchanged: nothing here is published, so no published number changed.

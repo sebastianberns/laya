@@ -88,13 +88,15 @@ true now — then the design. If the implementation diverges from the design, up
   not collapse, but the checkpoint loses to SigLIP2 zero-shot on CIFAR-100 and RVL-CDIP, shows no
   zero-shot transfer, and the head warm-start is refuted (random init wins on every task). Unfreezing
   the frozen SigLIP tower is the untried lever. Flux VAE latents were considered and rejected.
-- **`plans/2-SigLIP-tuning/`: unfreeze the SigLIP tower (code landed and smoke-tested, E5–E7 not run;
-  branch `sb/vision`).** Follows directly from initiative 1's open question — undertrained, or a
-  structural limit of the 64-token connector? `--vision-lr` (default 0 = frozen, today's behaviour)
-  gives the tower its own optimiser group, `--vision-unfreeze-last N` opens only its last N layers,
-  every run logs what it actually trains, and validation accuracy is reported per task per epoch.
-  Data/seed/epochs/batch are held fixed so any gain is attributable, and a **pre-registered decision
-  rule** decides the outcome: CIFAR-100 ≥ 0.80 and RVL-CDIP ≥ 0.40 means undertrained, neither moving
-  by ≥ +0.03 means structural and the line stops. `notebooks/laya_vision_siglip_tuning_2xT4_kaggle.ipynb`
-  runs the experiments and evaluates that rule in code. The four pre-publication fixes from
-  initiative 1's report have landed — `--init-head` now defaults to `random`.
+- **`plans/2-SigLIP-tuning/`: unfreeze the SigLIP tower (run and measured, not published; branch
+  `sb/vision`).** Measured outcomes are in [`report.md`](plans/2-SigLIP-tuning/report.md); the
+  pre-registered decision rule returned **PARTIAL**. Unfreezing took CIFAR-100 from 0.768 to 0.916,
+  past SigLIP2 zero-shot's 0.870, and typed-decisions to 0.612 — but RVL-CDIP moved only +0.018 and
+  still loses, so recognition was undertrained while document classification is not explained by an
+  undertrained tower. Costs: before-temperature calibration got worse on four of six tasks, and
+  fitted temperature degrades CIFAR-100's ECE again (the `choice:11+` bucket pools three tasks — a
+  per-task temperature is not expressible at inference). Training support is `--vision-lr` (default
+  0 = frozen), `--vision-unfreeze-last`, `--keep-epoch-checkpoints`, per-epoch per-task validation
+  and fp16-skip counts; `notebooks/laya_vision_siglip_tuning_2xT4_kaggle.ipynb` runs it. The next
+  hypothesis — RVL-CDIP is resolution-limited, testable with `--tiles-per-side 2` — belongs to a new
+  initiative, not this one.
