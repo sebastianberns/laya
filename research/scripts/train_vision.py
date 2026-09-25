@@ -75,6 +75,9 @@ def parse_args():
     ap.add_argument("--vision-unfreeze-last", type=int, default=0,
                     help="with --vision-lr, train only the last N of the tower's 12 layers (0 = all of it); "
                          "a fallback for memory pressure or forgetting, not an experimental arm")
+    ap.add_argument("--keep-epoch-checkpoints", action="store_true",
+                    help="keep every epoch's rolling checkpoint (checkpoint_epochN) instead of "
+                         "overwriting one; ~0.5 GB each, and the only way back if a later epoch degrades")
     ap.add_argument("--no-val-epoch", action="store_true",
                     help="skip the per-epoch validation pass (it is the only in-run signal of "
                          "overfitting or forgetting, so skip it only to save time)")
@@ -532,8 +535,13 @@ def main():
                 acc = val_accuracy(model, val_ex, proc, a, device, amp, loader_kw)
                 val_history.append(dict(epoch=epoch + 1, **{t: v["accuracy"] for t, v in acc.items()}))
                 log("    val: %s" % " | ".join("%s %.3f" % (t, v["accuracy"]) for t, v in acc.items()))
-            # rolling checkpoint, so a Kaggle timeout does not lose finished epochs
-            save_checkpoint(os.path.join(a.out, "checkpoint_latest"), model, proc,
+            # Rolling checkpoint, so a Kaggle timeout does not lose finished epochs. With
+            # --keep-epoch-checkpoints each epoch is kept instead of overwritten: a trainable tower
+            # can degrade between epochs (the LR probe collapsed outright at 2e-5), and without
+            # this the only surviving weights are the last ones, good or not. ~0.5 GB per epoch,
+            # and no fitted temperatures -- calibration only runs at the end of training.
+            name = "checkpoint_epoch%d" % (epoch + 1) if a.keep_epoch_checkpoints else "checkpoint_latest"
+            save_checkpoint(os.path.join(a.out, name), model, proc,
                             dict(cfg, checkpoint={"epoch": epoch + 1, "avg_loss": run_loss / max(1, n_b),
                                                   "val_accuracy": val_history}))
         if ddp:
